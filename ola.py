@@ -13,7 +13,7 @@ import psycopg2
 import pandas as pd
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.hxhifatmzdrjqhbkccxm:Conejito900$@aws-0-us-west-2.pooler.supabase.com:6543/postgres"
+SUPABASE_DB_URL = "postgresql://postgres.verwlkgitpllyneqxlao:Conejito800$@aws-0-us-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 
 CLIENTES = [
     "(Escribir nuevo)",
@@ -399,12 +399,9 @@ def main():
         layout="wide"
     )
 
-    # CSS personalizado
+    # CSS personalizado — compatible con modo claro y oscuro
     st.markdown("""
     <style>
-        .stApp { background-color: #F0F4F8; }
-        h1 { color: #1F3864; }
-        h2, h3 { color: #2E75B6; }
         .resultado-box {
             padding: 20px;
             border-radius: 10px;
@@ -413,11 +410,18 @@ def main():
             font-weight: bold;
             margin-top: 10px;
         }
-        .sobrante { background-color: #D5F5E3; color: #1E8449; border: 2px solid #27AE60; }
-        .faltante { background-color: #FADBD8; color: #C0392B; border: 2px solid #E74C3C; }
+        .sobrante {
+            background-color: rgba(39, 174, 96, 0.15);
+            color: #27AE60;
+            border: 2px solid #27AE60;
+        }
+        .faltante {
+            background-color: rgba(231, 76, 60, 0.15);
+            color: #E74C3C;
+            border: 2px solid #E74C3C;
+        }
         div[data-testid="metric-container"] {
-            background-color: white;
-            border: 1px solid #D6E4F0;
+            border: 1px solid rgba(128,128,128,0.2);
             border-radius: 8px;
             padding: 12px;
         }

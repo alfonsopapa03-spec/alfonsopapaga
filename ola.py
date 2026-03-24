@@ -13,7 +13,7 @@ import psycopg2
 import pandas as pd
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.verwlkgitpllyneqxlao:Conejito800$@aws-0-us-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
+SUPABASE_DB_URL = "postgresql://postgres.hxhifatmzdrjqhbkccxm:Conejito900$@aws-0-us-west-2.pooler.supabase.com:6543/postgres"
 
 CLIENTES = [
     "(Escribir nuevo)",

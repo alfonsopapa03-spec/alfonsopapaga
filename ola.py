@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v3: pestaña clientes, lista desplegable clientes, conductor auto por placa
+v4: fix conductor automático por placa en registro Y edición
 """
 
 import streamlit as st
@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"  # <- Pega aquí tu URL de conexión de Supabase
+SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 
 # ==================== FORMATO COLOMBIANO ====================
 def fmt(valor):
@@ -82,8 +82,6 @@ class DB:
         try:
             c = self.conn()
             cur = c.cursor()
-
-            # Tabla principal de anticipos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS anticipos_v1 (
                     id SERIAL PRIMARY KEY,
@@ -106,8 +104,6 @@ class DB:
                 ALTER TABLE anticipos_v1
                 ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''
             """)
-
-            # Tabla de clientes adicionales
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS clientes_extra (
                     id SERIAL PRIMARY KEY,
@@ -115,7 +111,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-
             c.commit()
             c.close()
         except Exception as e:
@@ -125,9 +120,7 @@ class DB:
     def obtener_clientes_extra(self):
         try:
             c = self.conn()
-            df = pd.read_sql_query(
-                "SELECT * FROM clientes_extra ORDER BY nombre", c
-            )
+            df = pd.read_sql_query("SELECT * FROM clientes_extra ORDER BY nombre", c)
             c.close()
             return df
         except:
@@ -144,7 +137,7 @@ class DB:
             c.commit()
             c.close()
             return True
-        except Exception as e:
+        except:
             return False
 
     def eliminar_cliente(self, cliente_id):
@@ -285,7 +278,6 @@ class DB:
 
 # ==================== HELPER: lista completa de clientes ====================
 def get_lista_clientes(db):
-    """Combina clientes default + clientes extra de la BD, ordenados"""
     extras_df = db.obtener_clientes_extra()
     extras = extras_df['nombre'].tolist() if not extras_df.empty else []
     todos = sorted(set(CLIENTES_DEFAULT + extras))
@@ -350,13 +342,11 @@ def main():
 
             with col1:
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
-
                 cliente = st.selectbox(
                     "Cliente",
                     lista_clientes,
                     help="Si no aparece el cliente, agrégalo en la pestaña 🏢 Clientes"
                 )
-
                 manifiesto = st.text_input(
                     "Número de manifiesto ✱",
                     placeholder="Ej: 1234567",
@@ -383,7 +373,7 @@ def main():
 
             if submitted:
                 # Leer placa y conductor del session_state (definidos fuera del form)
-                placa       = st.session_state.get("reg_placa", PLACAS[0])
+                placa = st.session_state.get("reg_placa", PLACAS[0])
                 conductor_final = PLACA_CONDUCTOR.get(placa, "")
                 errores = []
                 if not manifiesto.strip():
@@ -535,11 +525,11 @@ def main():
             )
 
         estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
-        fi_h  = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
-        ff_h  = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
-        pl_h  = None if placa_h == "Todas" else placa_h
+        fi_h   = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
+        ff_h   = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
+        pl_h   = None if placa_h == "Todas" else placa_h
         cond_h = conductor_h if conductor_h else None
-        mf_h  = manifiesto_h.strip() if manifiesto_h else None
+        mf_h   = manifiesto_h.strip() if manifiesto_h else None
 
         df_hist = db.buscar(
             estado=estado_map[estado_filtro],
@@ -622,6 +612,8 @@ def main():
                 st.markdown("&nbsp;")
                 if st.button("✏️ Editar viaje", key="btn_editar"):
                     st.session_state.editando_id = viaje_sel
+                    # Inicializar la placa del editor con la placa del viaje seleccionado
+                    st.session_state.edit_placa_actual = row_sel['placa']
                     st.rerun()
 
                 st.markdown("&nbsp;")
@@ -662,6 +654,27 @@ def main():
                     lista_clientes_edit = [cliente_actual] + lista_clientes_edit
                 idx_cliente = lista_clientes_edit.index(cliente_actual)
 
+                # ── PLACA Y CONDUCTOR FUERA DEL FORM para actualización reactiva ──
+                idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
+
+                col_pre_e1, col_pre_e2 = st.columns(2)
+                with col_pre_e1:
+                    placa_e = st.selectbox(
+                        "Placa de la tractomula",
+                        PLACAS,
+                        index=idx_placa_edit,
+                        key="edit_placa"   # <-- key única para el editor
+                    )
+                with col_pre_e2:
+                    conductor_edit_display = PLACA_CONDUCTOR.get(placa_e, "")
+                    st.text_input(
+                        "Conductor (automático)",
+                        value=conductor_edit_display if conductor_edit_display else "Sin conductor asignado",
+                        disabled=True,
+                        key="edit_conductor_display"
+                    )
+
+                # ── Resto del formulario (sin placa ni conductor) ──
                 with st.form(f"form_editar_{eid}"):
                     col1, col2 = st.columns(2)
 
@@ -669,14 +682,6 @@ def main():
                         fecha_e = st.date_input(
                             "Fecha del viaje",
                             value=pd.to_datetime(viaje_edit['fecha_viaje']).date()
-                        )
-                        idx_placa = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
-                        placa_e = st.selectbox("Placa", PLACAS, index=idx_placa)
-                        conductor_e_val = PLACA_CONDUCTOR.get(placa_e, viaje_edit['conductor'])
-                        st.text_input(
-                            "Conductor (automático)",
-                            value=conductor_e_val,
-                            disabled=True
                         )
                         cliente_e = st.selectbox(
                             "Cliente", lista_clientes_edit, index=idx_cliente
@@ -710,7 +715,10 @@ def main():
                         cancelar_edit = st.form_submit_button("✖ Cancelar")
 
                     if guardar_edit:
-                        conductor_edit_final = PLACA_CONDUCTOR.get(placa_e, viaje_edit['conductor'])
+                        # Leer placa desde session_state (definida FUERA del form)
+                        placa_guardada = st.session_state.get("edit_placa", PLACAS[0])
+                        conductor_edit_final = PLACA_CONDUCTOR.get(placa_guardada, "")
+
                         errores_e = []
                         if not manifiesto_e.strip():
                             errores_e.append("El número de manifiesto es obligatorio")
@@ -727,7 +735,7 @@ def main():
                         else:
                             ok = db.editar_viaje(eid, {
                                 'fecha_viaje': fecha_e,
-                                'placa': placa_e,
+                                'placa': placa_guardada,
                                 'conductor': conductor_edit_final.strip().upper(),
                                 'cliente': cliente_e.strip().upper(),
                                 'origen': origen_e.strip().upper(),
@@ -753,7 +761,6 @@ def main():
             "Los clientes predeterminados siempre estarán disponibles."
         )
 
-        # Clientes predeterminados (solo lectura)
         st.subheader("Clientes predeterminados")
         cols = st.columns(len(CLIENTES_DEFAULT))
         for i, c_def in enumerate(CLIENTES_DEFAULT):
@@ -762,7 +769,6 @@ def main():
 
         st.divider()
 
-        # Agregar cliente nuevo
         st.subheader("Agregar cliente nuevo")
         with st.form("form_nuevo_cliente", clear_on_submit=True):
             nuevo_cliente = st.text_input(
@@ -786,7 +792,6 @@ def main():
 
         st.divider()
 
-        # Clientes adicionales guardados
         st.subheader("Clientes adicionales registrados")
         df_extras = db.obtener_clientes_extra()
 
@@ -807,7 +812,7 @@ def main():
                             if st.button("Sí", key=f"si_cli_{row['id']}"):
                                 db.eliminar_cliente(row['id'])
                                 st.session_state.confirmar_eliminar_cliente = None
-                                st.success(f"Cliente eliminado.")
+                                st.success("Cliente eliminado.")
                                 st.rerun()
                         with c_no:
                             if st.button("No", key=f"no_cli_{row['id']}"):

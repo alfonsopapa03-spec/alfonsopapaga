@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v5: fix conductor siempre sincronizado con placa via session_state
+v6: conductor como campo de texto libre (sin autocompletado por placa)
 """
 
 import streamlit as st
@@ -32,7 +32,7 @@ def limpiar(texto):
 def hora_colombia():
     return datetime.utcnow() - timedelta(hours=5)
 
-# ==================== PLACAS Y CONDUCTORES ====================
+# ==================== PLACAS ====================
 PLACAS = [
     "NOX459", "NOX460", "NOX461", "SON047", "SON048",
     "SOP148", "SOP149", "SOP150", "SRO661", "SRO672",
@@ -40,25 +40,24 @@ PLACAS = [
     "UYY788", "PSX350"
 ]
 
-PLACA_CONDUCTOR = {
-    "NOX459": "GONZALO",
-    "NOX460": "JOSE ORTEGA",
-    "NOX461": "CARLOS TAFUR",
-    "SON047": "ISAIAS VESGA",
-    "SON048": "FLAVIO MALTE",
-    "SOP148": "SHITH",
-    "SOP149": "",
-    "SOP150": "RAMON TAFUR",
-    "SRO661": "JULIAN CALETH",
-    "SRO672": "PEDRO JR",
-    "TMW882": "REIMUR MANUEL",
-    "TRL282": "CHRISTIAN MARTINEZ",
-    "TRL298": "YEIMI DUQUE",
-    "UYQ308": "",
-    "UYV084": "",
-    "UYY788": "EDUARDO OLIVARES",
-    "PSX350": "EDGAR DE JESUS",
-}
+# Lista de conductores para el desplegable
+CONDUCTORES = [
+    "CARLOS TAFUR",
+    "CHRISTIAN MARTINEZ",
+    "EDGAR DE JESUS",
+    "EDUARDO OLIVARES",
+    "FLAVIO MALTE",
+    "GONZALO",
+    "ISAIAS VESGA",
+    "JOSE ORTEGA",
+    "JULIAN CALETH",
+    "PEDRO JR",
+    "RAMON TAFUR",
+    "REIMUR MANUEL",
+    "SHITH",
+    "YEIMI DUQUE",
+    "SIN CONDUCTOR ASIGNADO",
+]
 
 CLIENTES_DEFAULT = [
     "GLOBO EXPRESS",
@@ -315,44 +314,25 @@ def main():
 
         lista_clientes = get_lista_clientes(db)
 
-        # Placa y conductor FUERA del form — se leen siempre desde session_state
-        col_pre1, col_pre2 = st.columns(2)
-        with col_pre1:
-            st.selectbox(
-                "Placa de la tractomula",
-                PLACAS,
-                key="reg_placa"          # <-- el valor vive en session_state
-            )
-        with col_pre2:
-            # ✅ Leer SIEMPRE desde session_state para garantizar sincronía
-            placa_actual = st.session_state.get("reg_placa", PLACAS[0])
-            conductor_mostrado = PLACA_CONDUCTOR.get(placa_actual, "")
-            st.text_input(
-                "Conductor (automático)",
-                value=conductor_mostrado if conductor_mostrado else "Sin conductor asignado",
-                disabled=True,
-                key="reg_conductor_display"
-            )
-
-        st.divider()
-
         with st.form("form_registro", clear_on_submit=True):
             col1, col2 = st.columns(2)
 
             with col1:
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
+                placa = st.selectbox("Placa de la tractomula", PLACAS)
+                conductor = st.selectbox("Conductor", CONDUCTORES)
                 cliente = st.selectbox(
                     "Cliente",
                     lista_clientes,
                     help="Si no aparece el cliente, agrégalo en la pestaña 🏢 Clientes"
                 )
+
+            with col2:
                 manifiesto = st.text_input(
                     "Número de manifiesto ✱",
                     placeholder="Ej: 1234567",
                     help="Campo obligatorio"
                 )
-
-            with col2:
                 origen = st.text_input("Origen", placeholder="Ciudad de origen")
                 destino = st.text_input("Destino", placeholder="Ciudad de destino")
                 anticipo_txt = st.text_input(
@@ -371,10 +351,6 @@ def main():
             submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
 
             if submitted:
-                # Leer placa y conductor desde session_state
-                placa = st.session_state.get("reg_placa", PLACAS[0])
-                conductor_final = PLACA_CONDUCTOR.get(placa, "")
-
                 errores = []
                 if not manifiesto.strip():
                     errores.append("El número de manifiesto es obligatorio")
@@ -392,7 +368,7 @@ def main():
                     nuevo_id = db.registrar_viaje({
                         'fecha_viaje': fecha_viaje,
                         'placa': placa,
-                        'conductor': conductor_final.strip().upper(),
+                        'conductor': conductor.strip().upper(),
                         'cliente': cliente.strip().upper(),
                         'origen': origen.strip().upper(),
                         'destino': destino.strip().upper(),
@@ -405,7 +381,7 @@ def main():
 ✅ **Viaje registrado exitosamente (ID: {nuevo_id})**
 
 - Manifiesto: **{manifiesto.strip().upper()}**
-- Placa: {placa} | Conductor: {conductor_final.upper() or '(sin asignar)'}
+- Placa: {placa} | Conductor: {conductor.upper()}
 - Ruta: {origen.upper()} → {destino.upper()}
 - Cliente: {cliente.upper()}
 - Anticipo: **${fmt(anticipo)} COP**
@@ -654,25 +630,12 @@ def main():
 
                 idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
 
-                # Placa y conductor FUERA del form — leídos desde session_state
-                col_pre_e1, col_pre_e2 = st.columns(2)
-                with col_pre_e1:
-                    st.selectbox(
-                        "Placa de la tractomula",
-                        PLACAS,
-                        index=idx_placa_edit,
-                        key="edit_placa"      # valor vive en session_state
-                    )
-                with col_pre_e2:
-                    # ✅ Leer SIEMPRE desde session_state
-                    placa_edit_actual = st.session_state.get("edit_placa", PLACAS[0])
-                    conductor_edit_display = PLACA_CONDUCTOR.get(placa_edit_actual, "")
-                    st.text_input(
-                        "Conductor (automático)",
-                        value=conductor_edit_display if conductor_edit_display else "Sin conductor asignado",
-                        disabled=True,
-                        key="edit_conductor_display"
-                    )
+                # Conductor actual: buscar en la lista o usar el valor guardado
+                conductor_actual = viaje_edit['conductor']
+                if conductor_actual in CONDUCTORES:
+                    idx_conductor_edit = CONDUCTORES.index(conductor_actual)
+                else:
+                    idx_conductor_edit = 0
 
                 with st.form(f"form_editar_{eid}"):
                     col1, col2 = st.columns(2)
@@ -681,6 +644,16 @@ def main():
                         fecha_e = st.date_input(
                             "Fecha del viaje",
                             value=pd.to_datetime(viaje_edit['fecha_viaje']).date()
+                        )
+                        placa_e = st.selectbox(
+                            "Placa de la tractomula",
+                            PLACAS,
+                            index=idx_placa_edit
+                        )
+                        conductor_e = st.selectbox(
+                            "Conductor",
+                            CONDUCTORES,
+                            index=idx_conductor_edit
                         )
                         cliente_e = st.selectbox(
                             "Cliente", lista_clientes_edit, index=idx_cliente
@@ -714,10 +687,6 @@ def main():
                         cancelar_edit = st.form_submit_button("✖ Cancelar")
 
                     if guardar_edit:
-                        # ✅ Leer placa desde session_state (definida fuera del form)
-                        placa_guardada = st.session_state.get("edit_placa", PLACAS[0])
-                        conductor_edit_final = PLACA_CONDUCTOR.get(placa_guardada, "")
-
                         errores_e = []
                         if not manifiesto_e.strip():
                             errores_e.append("El número de manifiesto es obligatorio")
@@ -734,8 +703,8 @@ def main():
                         else:
                             ok = db.editar_viaje(eid, {
                                 'fecha_viaje': fecha_e,
-                                'placa': placa_guardada,
-                                'conductor': conductor_edit_final.strip().upper(),
+                                'placa': placa_e,
+                                'conductor': conductor_e.strip().upper(),
                                 'cliente': cliente_e.strip().upper(),
                                 'origen': origen_e.strip().upper(),
                                 'destino': destino_e.strip().upper(),

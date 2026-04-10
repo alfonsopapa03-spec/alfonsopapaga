@@ -1,780 +1,458 @@
 """
-Reporte de Gastos - Conductor / Tractomula
-Sistema de Gestión de Transporte de Carga - Colombia
-Versión 1.0
+Sistema de Registro y Legalización de Anticipos - Transporte de Carga
+Colombia - Conectado a Supabase (PostgreSQL)
 """
 
 import streamlit as st
-from datetime import datetime
-import io
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import psycopg2
 import pandas as pd
+from datetime import datetime, timedelta
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.hxhifatmzdrjqhbkccxm:Conejito900$@aws-0-us-west-2.pooler.supabase.com:6543/postgres"
+SUPABASE_DB_URL = "postgresql://postgres.wiomyjrmsrhcgvhgkbqe:Conejito800$@aws-1-us-west-2.pooler.supabase.com:6543/postgres"  # <- Pega aquí tu URL de conexión de Supabase
 
-CLIENTES = [
-    "(Escribir nuevo)",
-    "CLIENTE 1",
-    "CLIENTE 2",
-    "CLIENTE 3",
-]
-
-CONDUCTORES = [
-    "(Escribir nuevo)",
-    "HABID CAMACHO",
-    "JOSE ORTEGA PEREZ",
-    "ISAAC TAFUR",
-    "ISAIAS VESGA",
-    "FLAVIO ROSENDO MALTE TUTALCHA",
-    "SLITH JOSE ORTEGA PACHECO",
-    "ABRAHAM SEGUNDO ALVAREZ VALLE",
-    "RAMON TAFUR HERNANDEZ",
-    "PEDRO VILLAMIL",
-    "JESUS DAVID MONTE MOSQUERA",
-    "CHRISTIAN MARTINEZ NAVARRO",
-    "YEIMI DUQUE ZULUAGA",
-    "JULIAN CALETH CORONADO",
-    "CARLOS TAFUR",
-    "EDUARDO RAFAEL OLIVARES ALCAZAR",
-]
-
-TIPOS_CARGA = [
-    "(Escribir nuevo)",
-    "General",
-    "Granel",
-    "Refrigerada",
-    "Peligrosa",
-    "Sobredimensionada",
-    "Líquidos",
-    "Ganado",
-    "Maquinaria",
-]
-
-# ==================== FORMATO ====================
+# ==================== FORMATO COLOMBIANO ====================
 def fmt(valor):
-    """Formatea número estilo colombiano: 1.500.000"""
-    if valor is None or valor == 0:
-        return ""
+    """Formatea número estilo colombiano: 5.000.000"""
+    if valor is None:
+        return "0"
     try:
-        return f"{int(valor):,}".replace(",", ".")
+        return f"{int(float(valor)):,}".replace(',', '.')
     except:
         return str(valor)
 
 def limpiar(texto):
-    """Convierte texto colombiano a float"""
+    """Convierte texto colombiano a número: '5.000.000' -> 5000000.0"""
     if not texto:
         return 0.0
     try:
-        return float(str(texto).replace(".", "").replace(",", "."))
+        return float(str(texto).replace('.', '').replace(',', '.'))
     except:
         return 0.0
 
-def campo_dinero(label, key, col=None):
-    """Input de dinero con preview formateado"""
-    target = col if col else st
-    val_texto = target.text_input(label, value="", placeholder="0", key=key)
-    num = limpiar(val_texto)
-    if num > 0:
-        target.caption(f"💵 $ {fmt(num)}")
-    return num
+def hora_colombia():
+    """Retorna datetime actual en hora Colombia (UTC-5)"""
+    return datetime.utcnow() - timedelta(hours=5)
 
 # ==================== BASE DE DATOS ====================
-def init_db():
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URL)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reportes_gastos (
-                id SERIAL PRIMARY KEY,
-                fecha TEXT NOT NULL,
-                cliente TEXT NOT NULL,
-                conductor TEXT NOT NULL,
-                tipo_carga TEXT NOT NULL,
-                origen TEXT NOT NULL,
-                destino TEXT NOT NULL,
-                acpm REAL DEFAULT 0,
-                peaje REAL DEFAULT 0,
-                carpada REAL DEFAULT 0,
-                descarpada REAL DEFAULT 0,
-                amarre REAL DEFAULT 0,
-                desamarre REAL DEFAULT 0,
-                comida REAL DEFAULT 0,
-                transporte REAL DEFAULT 0,
-                arreglo_llantas REAL DEFAULT 0,
-                lavado REAL DEFAULT 0,
-                parque REAL DEFAULT 0,
-                reparacion REAL DEFAULT 0,
-                obs_reparacion TEXT DEFAULT '',
-                repuesto REAL DEFAULT 0,
-                hotel REAL DEFAULT 0,
-                comision REAL DEFAULT 0,
-                propina REAL DEFAULT 0,
-                cambio_cheque REAL DEFAULT 0,
-                policia_escolta REAL DEFAULT 0,
-                engrase REAL DEFAULT 0,
-                cargue REAL DEFAULT 0,
-                descargue REAL DEFAULT 0,
-                bascula REAL DEFAULT 0,
-                otros REAL DEFAULT 0,
-                total_gastos REAL DEFAULT 0,
-                anticipo REAL DEFAULT 0,
-                resultado REAL DEFAULT 0,
-                fecha_registro TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Error BD: {e}")
-        return False
+class DB:
+    def __init__(self):
+        self.url = SUPABASE_DB_URL
+        self._init_tabla()
 
-def guardar_reporte(datos):
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URL)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO reportes_gastos (
-                fecha, cliente, conductor, tipo_carga, origen, destino,
-                acpm, peaje, carpada, descarpada, amarre, desamarre,
-                comida, transporte, arreglo_llantas, lavado, parque,
-                reparacion, obs_reparacion, repuesto, hotel, comision,
-                propina, cambio_cheque, policia_escolta, engrase,
-                cargue, descargue, bascula, otros,
-                total_gastos, anticipo, resultado, fecha_registro
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,
-                %s,%s,%s,%s,
-                %s,%s,%s,%s,
-                %s,%s,%s,%s
-            ) RETURNING id
-        """, (
-            datos["fecha"], datos["cliente"], datos["conductor"],
-            datos["tipo_carga"], datos["origen"], datos["destino"],
-            datos["acpm"], datos["peaje"], datos["carpada"], datos["descarpada"],
-            datos["amarre"], datos["desamarre"], datos["comida"], datos["transporte"],
-            datos["arreglo_llantas"], datos["lavado"], datos["parque"],
-            datos["reparacion"], datos["obs_reparacion"], datos["repuesto"],
-            datos["hotel"], datos["comision"], datos["propina"],
-            datos["cambio_cheque"], datos["policia_escolta"], datos["engrase"],
-            datos["cargue"], datos["descargue"], datos["bascula"], datos["otros"],
-            datos["total_gastos"], datos["anticipo"], datos["resultado"],
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        reporte_id = cursor.fetchone()[0]
-        conn.commit()
-        conn.close()
-        return reporte_id
-    except Exception as e:
-        st.error(f"Error guardando: {e}")
-        return None
+    def conn(self):
+        return psycopg2.connect(self.url)
 
-def obtener_reportes():
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URL)
-        df = pd.read_sql_query("SELECT * FROM reportes_gastos ORDER BY id DESC", conn)
-        conn.close()
-        return df
-    except Exception as e:
-        st.error(f"Error cargando reportes: {e}")
-        return pd.DataFrame()
+    def _init_tabla(self):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS anticipos_v1 (
+                    id SERIAL PRIMARY KEY,
+                    fecha_viaje DATE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL,
+                    placa TEXT NOT NULL,
+                    conductor TEXT NOT NULL,
+                    cliente TEXT NOT NULL,
+                    origen TEXT NOT NULL,
+                    destino TEXT NOT NULL,
+                    valor_anticipo BIGINT NOT NULL,
+                    observaciones TEXT,
+                    legalizado BOOLEAN DEFAULT FALSE,
+                    fecha_legalizacion TIMESTAMP,
+                    legalizado_por TEXT,
+                    obs_legalizacion TEXT
+                )
+            """)
+            c.commit()
+            c.close()
+        except Exception as e:
+            st.error(f"Error inicializando tabla: {e}")
 
-def eliminar_reporte(rid):
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URL)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM reportes_gastos WHERE id = %s", (rid,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        st.error(f"Error eliminando: {e}")
+    def registrar_viaje(self, data):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("""
+                INSERT INTO anticipos_v1
+                (fecha_viaje, fecha_registro, placa, conductor, cliente,
+                 origen, destino, valor_anticipo, observaciones, legalizado)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                RETURNING id
+            """, (
+                data['fecha_viaje'],
+                hora_colombia(),
+                data['placa'],
+                data['conductor'],
+                data['cliente'],
+                data['origen'],
+                data['destino'],
+                int(data['valor_anticipo']),
+                data.get('observaciones', '')
+            ))
+            nuevo_id = cur.fetchone()[0]
+            c.commit()
+            c.close()
+            return nuevo_id
+        except Exception as e:
+            st.error(f"Error guardando viaje: {e}")
+            return None
 
-# ==================== EXCEL ====================
-def generar_excel(datos):
-    output = io.BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Reporte de Gastos"
+    def legalizar(self, viaje_id, nombre_quien_legaliza, obs_legalizacion=""):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("""
+                UPDATE anticipos_v1
+                SET legalizado = TRUE,
+                    fecha_legalizacion = %s,
+                    legalizado_por = %s,
+                    obs_legalizacion = %s
+                WHERE id = %s
+            """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id))
+            c.commit()
+            c.close()
+            return True
+        except Exception as e:
+            st.error(f"Error legalizando: {e}")
+            return False
 
-    # Estilos
-    azul_oscuro = PatternFill("solid", fgColor="1F3864")
-    azul_medio  = PatternFill("solid", fgColor="2E75B6")
-    azul_claro  = PatternFill("solid", fgColor="D6E4F0")
-    amarillo    = PatternFill("solid", fgColor="FFC000")
-    verde       = PatternFill("solid", fgColor="70AD47")
-    rojo        = PatternFill("solid", fgColor="FF0000")
-    gris        = PatternFill("solid", fgColor="F2F2F2")
+    def buscar(self, estado=None, fecha_ini=None, fecha_fin=None, placa=None, conductor=None):
+        try:
+            c = self.conn()
+            q = "SELECT * FROM anticipos_v1 WHERE 1=1"
+            params = []
+            if estado == "legalizado":
+                q += " AND legalizado = TRUE"
+            elif estado == "pendiente":
+                q += " AND legalizado = FALSE"
+            if fecha_ini:
+                q += " AND fecha_viaje >= %s"
+                params.append(fecha_ini)
+            if fecha_fin:
+                q += " AND fecha_viaje <= %s"
+                params.append(fecha_fin)
+            if placa:
+                q += " AND placa = %s"
+                params.append(placa)
+            if conductor:
+                q += " AND conductor ILIKE %s"
+                params.append(f"%{conductor}%")
+            q += " ORDER BY fecha_registro DESC"
+            df = pd.read_sql_query(q, c, params=params)
+            c.close()
+            return df
+        except Exception as e:
+            st.error(f"Error buscando: {e}")
+            return pd.DataFrame()
 
-    font_titulo   = Font(name="Calibri", bold=True, size=14, color="FFFFFF")
-    font_header   = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
-    font_label    = Font(name="Calibri", bold=True, size=10, color="1F3864")
-    font_valor    = Font(name="Calibri", size=10)
-    font_total    = Font(name="Calibri", bold=True, size=11, color="FFFFFF")
-    font_resultado= Font(name="Calibri", bold=True, size=12, color="FFFFFF")
+    def eliminar(self, viaje_id):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("DELETE FROM anticipos_v1 WHERE id = %s", (viaje_id,))
+            c.commit()
+            c.close()
+        except Exception as e:
+            st.error(f"Error eliminando: {e}")
 
-    borde = Border(
-        left=Side(style="thin", color="BFBFBF"),
-        right=Side(style="thin", color="BFBFBF"),
-        top=Side(style="thin", color="BFBFBF"),
-        bottom=Side(style="thin", color="BFBFBF"),
-    )
-    borde_grueso = Border(
-        left=Side(style="medium", color="1F3864"),
-        right=Side(style="medium", color="1F3864"),
-        top=Side(style="medium", color="1F3864"),
-        bottom=Side(style="medium", color="1F3864"),
-    )
+# ==================== PLACAS Y CONDUCTORES ====================
+PLACAS = [
+    "NOX459", "NOX460", "NOX461", "SON047", "SON048",
+    "SOP148", "SOP149", "SOP150", "SRO661", "SRO672",
+    "TMW882", "TRL282", "TRL298", "UYQ308", "UYV084",
+    "UYY788"
+]
 
-    fmt_cop = '"$"#,##0'
-
-    def cel(row, col, value, fill=None, font=None, align="left", number_format=None, border=None):
-        c = ws.cell(row=row, column=col, value=value)
-        if fill:   c.fill = fill
-        if font:   c.font = font
-        if border: c.border = border
-        c.alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
-        if number_format: c.number_format = number_format
-        return c
-
-    # ── TÍTULO ──────────────────────────────────────────────
-    ws.merge_cells("A1:F1")
-    cel(1, 1, "🚛  REPORTE DE GASTOS — TRANSPORTE DE CARGA",
-        fill=azul_oscuro, font=font_titulo, align="center")
-    ws.row_dimensions[1].height = 30
-
-    ws.merge_cells("A2:F2")
-    cel(2, 1, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
-        fill=azul_claro, font=Font(italic=True, size=9, color="555555"), align="center")
-
-    # ── ENCABEZADO DEL VIAJE ─────────────────────────────────
-    ws.merge_cells("A4:F4")
-    cel(4, 1, "INFORMACIÓN DEL VIAJE",
-        fill=azul_medio, font=font_header, align="center", border=borde)
-    ws.row_dimensions[4].height = 18
-
-    info = [
-        ("Fecha",         datos["fecha"]),
-        ("Cliente",       datos["cliente"]),
-        ("Conductor",     datos["conductor"]),
-        ("Tipo de Carga", datos["tipo_carga"]),
-        ("Origen",        datos["origen"]),
-        ("Destino",       datos["destino"]),
-    ]
-    r = 5
-    for i, (lab, val) in enumerate(info):
-        col_label = 1 + (i % 2) * 3
-        col_val   = col_label + 1
-        ws.merge_cells(start_row=r, start_column=col_val, end_row=r, end_column=col_val + 1)
-        cel(r, col_label, lab, fill=azul_claro, font=font_label, align="right", border=borde)
-        cel(r, col_val,   val, fill=gris,        font=font_valor, align="left",  border=borde)
-        if i % 2 == 1:
-            r += 1
-    ws.row_dimensions[5].height = 16
-    ws.row_dimensions[6].height = 16
-    ws.row_dimensions[7].height = 16
-
-    # ── TABLA DE GASTOS ──────────────────────────────────────
-    r += 1
-    ws.merge_cells(f"A{r}:F{r}")
-    cel(r, 1, "DETALLE DE GASTOS",
-        fill=azul_medio, font=font_header, align="center", border=borde)
-    ws.row_dimensions[r].height = 18
-    r += 1
-
-    # Cabecera columnas
-    for c, txt in enumerate(["#", "CONCEPTO", "VALOR (COP)", "", "OBSERVACIONES", ""], start=1):
-        ws.merge_cells(start_row=r, start_column=c, end_row=r, end_column=c) if c not in (3,5) else None
-        cel(r, c, txt, fill=azul_oscuro, font=font_header, align="center", border=borde)
-    ws.merge_cells(f"C{r}:D{r}")
-    ws.merge_cells(f"E{r}:F{r}")
-    ws.row_dimensions[r].height = 16
-    r += 1
-
-    partidas = [
-        ("1",  "ACPM (Combustible)",         datos["acpm"],           ""),
-        ("2",  "Peaje",                       datos["peaje"],          ""),
-        ("3",  "Carpada",                     datos["carpada"],        ""),
-        ("4",  "Descarpada",                  datos["descarpada"],     ""),
-        ("5",  "Amarre",                      datos["amarre"],         ""),
-        ("6",  "Desamarre",                   datos["desamarre"],      ""),
-        ("7",  "Comida",                      datos["comida"],         ""),
-        ("8",  "Transporte",                  datos["transporte"],     ""),
-        ("9",  "Arreglo de Llantas",          datos["arreglo_llantas"],""),
-        ("10", "Lavado",                      datos["lavado"],         ""),
-        ("11", "Parque",                      datos["parque"],         ""),
-        ("12", "Reparación",                  datos["reparacion"],     datos["obs_reparacion"]),
-        ("13", "Repuesto",                    datos["repuesto"],       ""),
-        ("14", "Hotel",                       datos["hotel"],          ""),
-        ("15", "Comisión",                    datos["comision"],       ""),
-        ("16", "Propina",                     datos["propina"],        ""),
-        ("17", "Cambio de Cheque",            datos["cambio_cheque"],  ""),
-        ("18", "Policía / Escolta",           datos["policia_escolta"],""),
-        ("19", "Engrase",                     datos["engrase"],        ""),
-        ("20", "Cargue",                      datos["cargue"],         ""),
-        ("21", "Descargue",                   datos["descargue"],      ""),
-        ("22", "Báscula",                     datos["bascula"],        ""),
-        ("23", "Otros",                       datos["otros"],          ""),
-    ]
-
-    for num, concepto, valor, obs in partidas:
-        bg = gris if int(num) % 2 == 0 else None
-        cel(r, 1, num,      fill=bg, font=font_valor, align="center", border=borde)
-        cel(r, 2, concepto, fill=bg, font=font_label,  align="left",   border=borde)
-        ws.merge_cells(f"C{r}:D{r}")
-        c = ws.cell(row=r, column=3, value=valor if valor else None)
-        c.fill = bg or PatternFill()
-        c.font = font_valor
-        c.border = borde
-        c.alignment = Alignment(horizontal="right", vertical="center")
-        c.number_format = fmt_cop
-        ws.merge_cells(f"E{r}:F{r}")
-        cel(r, 5, obs, fill=bg, font=font_valor, align="left", border=borde)
-        ws.row_dimensions[r].height = 15
-        r += 1
-
-    # ── TOTALES ──────────────────────────────────────────────
-    r += 1
-    # Total Gastos
-    ws.merge_cells(f"A{r}:B{r}")
-    cel(r, 1, "TOTAL DE GASTOS", fill=amarillo,
-        font=Font(bold=True, size=11, color="1F3864"), align="right", border=borde_grueso)
-    ws.merge_cells(f"C{r}:D{r}")
-    c = ws.cell(row=r, column=3, value=datos["total_gastos"])
-    c.fill = amarillo; c.font = font_total; c.border = borde_grueso
-    c.alignment = Alignment(horizontal="right", vertical="center")
-    c.number_format = fmt_cop
-    ws.row_dimensions[r].height = 20
-    r += 1
-
-    # Anticipo
-    ws.merge_cells(f"A{r}:B{r}")
-    cel(r, 1, "VALOR DEL ANTICIPO", fill=azul_claro,
-        font=font_label, align="right", border=borde)
-    ws.merge_cells(f"C{r}:D{r}")
-    c = ws.cell(row=r, column=3, value=datos["anticipo"])
-    c.fill = azul_claro; c.font = font_valor; c.border = borde
-    c.alignment = Alignment(horizontal="right", vertical="center")
-    c.number_format = fmt_cop
-    ws.row_dimensions[r].height = 18
-    r += 1
-
-    # Resultado
-    resultado = datos["resultado"]
-    color_resultado = verde if resultado >= 0 else rojo
-    etiqueta_resultado = "SOBRANTE (Anticipo > Gastos)" if resultado >= 0 else "FALTANTE (Gastos > Anticipo)"
-    ws.merge_cells(f"A{r}:B{r}")
-    cel(r, 1, etiqueta_resultado, fill=color_resultado,
-        font=font_resultado, align="right", border=borde_grueso)
-    ws.merge_cells(f"C{r}:D{r}")
-    c = ws.cell(row=r, column=3, value=abs(resultado))
-    c.fill = color_resultado; c.font = font_resultado; c.border = borde_grueso
-    c.alignment = Alignment(horizontal="right", vertical="center")
-    c.number_format = fmt_cop
-    ws.row_dimensions[r].height = 22
-
-    # ── ANCHOS DE COLUMNAS ───────────────────────────────────
-    ws.column_dimensions["A"].width = 5
-    ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 4
-    ws.column_dimensions["E"].width = 30
-    ws.column_dimensions["F"].width = 4
-
-    wb.save(output)
-    output.seek(0)
-    return output
-
+PLACA_CONDUCTOR = {
+    "NOX459": "HABID CAMACHO",
+    "NOX460": "JOSE ORTEGA PEREZ",
+    "NOX461": "ISAAC TAFUR",
+    "SON047": "ISAIAS VESGA",
+    "SON048": "FLAVIO ROSENDO MALTE TUTALCHA",
+    "SOP148": "SLITH JOSE ORTEGA PACHECO",
+    "SOP149": "ABRAHAM SEGUNDO ALVAREZ VALLE",
+    "SOP150": "RAMON TAFUR HERNANDEZ",
+    "SRO661": "",
+    "SRO672": "PEDRO VILLAMIL",
+    "TMW882": "JESUS DAVID MONTE MOSQUERA",
+    "TRL282": "CHRISTIAN MARTINEZ NAVARRO",
+    "TRL298": "YEIMI DUQUE ZULUAGA",
+    "UYQ308": "JULIAN CALETH CORONADO",
+    "UYV084": "CARLOS TAFUR",
+    "UYY788": "EDUARDO RAFAEL OLIVARES ALCAZAR",
+}
 
 # ==================== APP PRINCIPAL ====================
 def main():
     st.set_page_config(
-        page_title="Reporte de Gastos - Transporte",
-        page_icon="🚛",
-        layout="wide"
+        page_title="Anticipos - Transporte de Carga",
+        layout="wide",
+        page_icon="🚛"
     )
 
-    # CSS personalizado — compatible con modo claro y oscuro
-    st.markdown("""
-    <style>
-        .resultado-box {
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            font-size: 22px;
-            font-weight: bold;
-            margin-top: 10px;
-        }
-        .sobrante {
-            background-color: rgba(39, 174, 96, 0.15);
-            color: #27AE60;
-            border: 2px solid #27AE60;
-        }
-        .faltante {
-            background-color: rgba(231, 76, 60, 0.15);
-            color: #E74C3C;
-            border: 2px solid #E74C3C;
-        }
-        div[data-testid="metric-container"] {
-            border: 1px solid rgba(128,128,128,0.2);
-            border-radius: 8px;
-            padding: 12px;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    st.title("🚛 Gestión de Anticipos - Transporte de Carga")
 
-    st.title("🚛 Reporte de Gastos — Transporte de Carga")
-    st.markdown("**Registro de gastos por viaje | Colombia**")
-    st.divider()
+    if 'db' not in st.session_state:
+        st.session_state.db = DB()
+    db = st.session_state.db
 
-    init_db()
+    tab_reg, tab_leg, tab_hist = st.tabs([
+        "📝 Registrar Viaje",
+        "✅ Legalizar Anticipos",
+        "📋 Historial"
+    ])
 
-    # ── TABS ─────────────────────────────────────────────────
-    tab_nuevo, tab_historial = st.tabs(["📝 Nuevo Reporte", "📂 Historial"])
+    # ==================== TAB 1: REGISTRAR ====================
+    with tab_reg:
+        st.header("Registrar nuevo viaje con anticipo")
 
-    # ═══════════════════════════════════════════════════════
-    # TAB 1: NUEVO REPORTE
-    # ═══════════════════════════════════════════════════════
-    with tab_nuevo:
+        with st.form("form_registro", clear_on_submit=True):
+            col1, col2 = st.columns(2)
 
-        # ── BLOQUE 1: DATOS DEL VIAJE ────────────────────────
-        st.subheader("📋 Datos del Viaje")
+            with col1:
+                fecha_viaje = st.date_input(
+                    "Fecha del viaje",
+                    value=datetime.today()
+                )
+                placa = st.selectbox("Placa de la tractomula", PLACAS)
+                conductor_auto = PLACA_CONDUCTOR.get(placa, "")
+                conductor = st.text_input(
+                    "Conductor",
+                    value=conductor_auto,
+                    help="Se asigna automáticamente según la placa"
+                )
+                cliente = st.text_input("Cliente", placeholder="Nombre del cliente")
 
-        col1, col2, col3 = st.columns(3)
+            with col2:
+                origen = st.text_input("Origen", placeholder="Ciudad de origen")
+                destino = st.text_input("Destino", placeholder="Ciudad de destino")
+                anticipo_txt = st.text_input(
+                    "Valor del anticipo (COP)",
+                    placeholder="Ejemplo: 1.500.000"
+                )
+                anticipo = limpiar(anticipo_txt)
+                if anticipo > 0:
+                    st.caption(f"💵 {fmt(anticipo)} COP")
 
-        with col1:
-            fecha = st.date_input("📅 Fecha", value=datetime.today())
+                observaciones = st.text_area(
+                    "Observaciones",
+                    placeholder="Notas adicionales del viaje...",
+                    height=80
+                )
 
-            sel_cliente = st.selectbox("🏢 Cliente", CLIENTES, key="sel_cliente")
-            if sel_cliente == "(Escribir nuevo)":
-                cliente = st.text_input("Nombre del cliente", key="cliente_manual")
-            else:
-                cliente = sel_cliente
+            submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
 
-        with col2:
-            sel_conductor = st.selectbox("👤 Conductor", CONDUCTORES, key="sel_conductor")
-            if sel_conductor == "(Escribir nuevo)":
-                conductor = st.text_input("Nombre del conductor", key="conductor_manual")
-            else:
-                conductor = sel_conductor
+            if submitted:
+                errores = []
+                if not conductor.strip():
+                    errores.append("Conductor es obligatorio")
+                if not cliente.strip():
+                    errores.append("Cliente es obligatorio")
+                if not origen.strip():
+                    errores.append("Origen es obligatorio")
+                if not destino.strip():
+                    errores.append("Destino es obligatorio")
+                if anticipo <= 0:
+                    errores.append("El valor del anticipo debe ser mayor a 0")
 
-            sel_tipo = st.selectbox("📦 Tipo de Carga", TIPOS_CARGA, key="sel_tipo")
-            if sel_tipo == "(Escribir nuevo)":
-                tipo_carga = st.text_input("Tipo de carga", key="tipo_manual")
-            else:
-                tipo_carga = sel_tipo
+                if errores:
+                    for e in errores:
+                        st.error(f"⚠️ {e}")
+                else:
+                    nuevo_id = db.registrar_viaje({
+                        'fecha_viaje': fecha_viaje,
+                        'placa': placa,
+                        'conductor': conductor.strip().upper(),
+                        'cliente': cliente.strip().upper(),
+                        'origen': origen.strip().upper(),
+                        'destino': destino.strip().upper(),
+                        'valor_anticipo': anticipo,
+                        'observaciones': observaciones.strip()
+                    })
+                    if nuevo_id:
+                        st.success(f"""
+                        ✅ **Viaje registrado exitosamente (ID: {nuevo_id})**
+                        
+                        - Placa: {placa} | Conductor: {conductor.upper()}
+                        - Ruta: {origen.upper()} → {destino.upper()}
+                        - Cliente: {cliente.upper()}
+                        - Anticipo: **${fmt(anticipo)} COP**
+                        - Estado: 🔴 Pendiente de legalización
+                        """)
 
-        with col3:
-            origen  = st.text_input("🏁 Origen",  placeholder="Ej: Bogotá")
-            destino = st.text_input("🎯 Destino", placeholder="Ej: Medellín")
+    # ==================== TAB 2: LEGALIZAR ====================
+    with tab_leg:
+        st.header("Legalizar anticipos pendientes")
+        st.info("Solo los viajes en estado **Pendiente** aparecen aquí para legalizar.")
 
-        st.divider()
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            fecha_ini_leg = st.date_input("Desde", value=None, key="leg_fi")
+        with col_f2:
+            fecha_fin_leg = st.date_input("Hasta", value=None, key="leg_ff")
+        with col_f3:
+            placa_leg = st.selectbox("Placa", ["Todas"] + PLACAS, key="leg_placa")
 
-        # ── BLOQUE 2: GASTOS ─────────────────────────────────
-        st.subheader("💸 Detalle de Gastos")
+        fi = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
+        ff = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
+        pl = None if placa_leg == "Todas" else placa_leg
+
+        df_pendientes = db.buscar(estado="pendiente", fecha_ini=fi, fecha_fin=ff, placa=pl)
+
+        if df_pendientes.empty:
+            st.success("✅ No hay anticipos pendientes de legalización.")
+        else:
+            st.warning(f"🔴 {len(df_pendientes)} viaje(s) pendiente(s) de legalización")
+
+            for _, row in df_pendientes.iterrows():
+                with st.expander(
+                    f"ID {row['id']} | {row['fecha_viaje']} | {row['placa']} | "
+                    f"{row['conductor']} | {row['origen']} → {row['destino']} | "
+                    f"${fmt(row['valor_anticipo'])} COP"
+                ):
+                    col_info, col_form = st.columns([2, 2])
+
+                    with col_info:
+                        st.markdown("**Datos del viaje:**")
+                        st.write(f"📅 Fecha: {row['fecha_viaje']}")
+                        st.write(f"🚛 Placa: {row['placa']}")
+                        st.write(f"👤 Conductor: {row['conductor']}")
+                        st.write(f"🏢 Cliente: {row['cliente']}")
+                        st.write(f"📍 Ruta: {row['origen']} → {row['destino']}")
+                        st.write(f"💰 Anticipo: **${fmt(row['valor_anticipo'])} COP**")
+                        if row.get('observaciones'):
+                            st.write(f"📝 Obs: {row['observaciones']}")
+
+                    with col_form:
+                        st.markdown("**Legalizar este viaje:**")
+                        nombre_leg = st.text_input(
+                            "Tu nombre completo (obligatorio)",
+                            placeholder="Escribe tu nombre para legalizar",
+                            key=f"nombre_leg_{row['id']}"
+                        )
+                        obs_leg = st.text_area(
+                            "Observaciones de legalización (opcional)",
+                            placeholder="Notas sobre la legalización...",
+                            height=80,
+                            key=f"obs_leg_{row['id']}"
+                        )
+                        if st.button(
+                            "✅ Marcar como LEGALIZADO",
+                            key=f"btn_leg_{row['id']}",
+                            type="primary"
+                        ):
+                            if not nombre_leg.strip():
+                                st.error("⚠️ Debes escribir tu nombre para poder legalizar.")
+                            else:
+                                ok = db.legalizar(
+                                    row['id'],
+                                    nombre_leg.strip().upper(),
+                                    obs_leg.strip()
+                                )
+                                if ok:
+                                    st.success(
+                                        f"✅ Viaje ID {row['id']} legalizado por "
+                                        f"**{nombre_leg.upper()}** a las "
+                                        f"{hora_colombia().strftime('%H:%M')} (hora Colombia)"
+                                    )
+                                    st.rerun()
+
+    # ==================== TAB 3: HISTORIAL ====================
+    with tab_hist:
+        st.header("Historial de viajes")
 
         col1, col2, col3, col4 = st.columns(4)
-
         with col1:
-            st.markdown("**🛢️ Operación**")
-            acpm         = campo_dinero("ACPM (Combustible)",   "acpm",         col1)
-            peaje        = campo_dinero("Peaje",                "peaje",        col1)
-            carpada      = campo_dinero("Carpada",              "carpada",      col1)
-            descarpada   = campo_dinero("Descarpada",           "descarpada",   col1)
-            amarre       = campo_dinero("Amarre",               "amarre",       col1)
-            desamarre    = campo_dinero("Desamarre",            "desamarre",    col1)
-
+            estado_filtro = st.selectbox(
+                "Estado",
+                ["Todos", "Pendientes", "Legalizados"],
+                key="hist_estado"
+            )
         with col2:
-            st.markdown("**🍽️ Viáticos**")
-            comida       = campo_dinero("Comida",               "comida",       col2)
-            transporte   = campo_dinero("Transporte",           "transporte",   col2)
-            hotel        = campo_dinero("Hotel",                "hotel",        col2)
-            comision     = campo_dinero("Comisión",             "comision",     col2)
-            propina      = campo_dinero("Propina",              "propina",      col2)
-
+            fecha_ini_h = st.date_input("Desde", value=None, key="hist_fi")
         with col3:
-            st.markdown("**🔧 Mantenimiento**")
-            arreglo_llantas = campo_dinero("Arreglo de Llantas",  "arreglo_llantas", col3)
-            lavado          = campo_dinero("Lavado",               "lavado",          col3)
-            parque          = campo_dinero("Parque",               "parque",          col3)
-            engrase         = campo_dinero("Engrase",              "engrase",         col3)
-            repuesto        = campo_dinero("Repuesto",             "repuesto",        col3)
-
-            st.markdown("**🔩 Reparación**")
-            reparacion      = campo_dinero("Reparación",           "reparacion",      col3)
-            obs_reparacion  = col3.text_input("Observaciones reparación", placeholder="Describir...", key="obs_rep")
-
+            fecha_fin_h = st.date_input("Hasta", value=None, key="hist_ff")
         with col4:
-            st.markdown("**📋 Otros Gastos**")
-            cambio_cheque   = campo_dinero("Cambio de Cheque",    "cambio_cheque",   col4)
-            policia_escolta = campo_dinero("Policía / Escolta",   "policia_escolta", col4)
-            cargue          = campo_dinero("Cargue",              "cargue",          col4)
-            descargue       = campo_dinero("Descargue",           "descargue",       col4)
-            bascula         = campo_dinero("Báscula",             "bascula",         col4)
-            otros           = campo_dinero("Otros",               "otros",           col4)
+            placa_h = st.selectbox("Placa", ["Todas"] + PLACAS, key="hist_placa")
 
-        st.divider()
+        conductor_h = st.text_input("Buscar conductor", placeholder="Nombre parcial...", key="hist_cond")
 
-        # ── BLOQUE 3: RESUMEN Y RESULTADO ────────────────────
-        st.subheader("📊 Resumen")
+        estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
+        estado_q = estado_map[estado_filtro]
+        fi_h = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
+        ff_h = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
+        pl_h = None if placa_h == "Todas" else placa_h
+        cond_h = conductor_h if conductor_h else None
 
-        # Calcular total de gastos
-        total_gastos = (
-            acpm + peaje + carpada + descarpada + amarre + desamarre +
-            comida + transporte + hotel + comision + propina +
-            arreglo_llantas + lavado + parque + engrase + repuesto +
-            reparacion + cambio_cheque + policia_escolta +
-            cargue + descargue + bascula + otros
-        )
+        df_hist = db.buscar(estado=estado_q, fecha_ini=fi_h, fecha_fin=ff_h, placa=pl_h, conductor=cond_h)
 
-        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-        with col_t1:
-            st.metric("💸 Total Gastos", f"$ {fmt(total_gastos)}" if total_gastos else "$ 0")
-        with col_t2:
-            anticipo_texto = st.text_input("💰 Valor del Anticipo (COP)", value="", placeholder="0", key="anticipo_input")
-            anticipo = limpiar(anticipo_texto)
-            if anticipo > 0:
-                st.caption(f"💵 $ {fmt(anticipo)}")
-
-        resultado = anticipo - total_gastos
-
-        with col_t3:
-            st.metric("🎯 Anticipo", f"$ {fmt(anticipo)}" if anticipo else "$ 0")
-        with col_t4:
-            if resultado >= 0:
-                st.metric("✅ Sobrante", f"$ {fmt(resultado)}")
-            else:
-                st.metric("⚠️ Faltante", f"$ {fmt(abs(resultado))}")
-
-        # Caja de resultado visual
-        if total_gastos > 0 or anticipo > 0:
-            if resultado >= 0:
-                st.markdown(f"""
-                <div class="resultado-box sobrante">
-                    ✅ SOBRANTE: El anticipo cubre los gastos<br>
-                    Anticipo ($ {fmt(anticipo)}) − Gastos ($ {fmt(total_gastos)}) = <strong>$ {fmt(resultado)}</strong>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                <div class="resultado-box faltante">
-                    ⚠️ FALTANTE: Los gastos superan el anticipo<br>
-                    Anticipo ($ {fmt(anticipo)}) − Gastos ($ {fmt(total_gastos)}) = <strong>−$ {fmt(abs(resultado))}</strong>
-                </div>
-                """, unsafe_allow_html=True)
-
-        st.divider()
-
-        # ── BOTONES ──────────────────────────────────────────
-        col_b1, col_b2 = st.columns(2)
-
-        datos_reporte = {
-            "fecha":           fecha.strftime("%Y-%m-%d"),
-            "cliente":         cliente,
-            "conductor":       conductor,
-            "tipo_carga":      tipo_carga,
-            "origen":          origen,
-            "destino":         destino,
-            "acpm":            acpm,
-            "peaje":           peaje,
-            "carpada":         carpada,
-            "descarpada":      descarpada,
-            "amarre":          amarre,
-            "desamarre":       desamarre,
-            "comida":          comida,
-            "transporte":      transporte,
-            "arreglo_llantas": arreglo_llantas,
-            "lavado":          lavado,
-            "parque":          parque,
-            "reparacion":      reparacion,
-            "obs_reparacion":  obs_reparacion,
-            "repuesto":        repuesto,
-            "hotel":           hotel,
-            "comision":        comision,
-            "propina":         propina,
-            "cambio_cheque":   cambio_cheque,
-            "policia_escolta": policia_escolta,
-            "engrase":         engrase,
-            "cargue":          cargue,
-            "descargue":       descargue,
-            "bascula":         bascula,
-            "otros":           otros,
-            "total_gastos":    total_gastos,
-            "anticipo":        anticipo,
-            "resultado":       resultado,
-        }
-
-        with col_b1:
-            if st.button("💾 Guardar Reporte", type="primary", use_container_width=True):
-                if not cliente or not conductor or not origen or not destino:
-                    st.error("⚠️ Completa los campos: Cliente, Conductor, Origen y Destino")
-                else:
-                    rid = guardar_reporte(datos_reporte)
-                    if rid:
-                        st.success(f"✅ Reporte guardado correctamente (ID: {rid})")
-                    else:
-                        st.error("❌ Error al guardar. Revisa la conexión.")
-
-        with col_b2:
-            excel_bytes = generar_excel(datos_reporte)
-            nombre_archivo = f"Gastos_{conductor.replace(' ','_')}_{fecha.strftime('%d-%m-%Y')}.xlsx"
-            st.download_button(
-                label="📥 Descargar en Excel",
-                data=excel_bytes,
-                file_name=nombre_archivo,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
-    # ═══════════════════════════════════════════════════════
-    # TAB 2: HISTORIAL
-    # ═══════════════════════════════════════════════════════
-    with tab_historial:
-        st.subheader("📂 Historial de Reportes")
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            filtro_conductor = st.text_input("🔍 Filtrar por Conductor", key="hist_conductor")
-        with col2:
-            filtro_cliente   = st.text_input("🔍 Filtrar por Cliente",   key="hist_cliente")
-        with col3:
-            if st.button("🔄 Actualizar", type="primary"):
-                st.rerun()
-
-        df = obtener_reportes()
-
-        if df.empty:
-            st.info("No hay reportes guardados aún.")
+        if df_hist.empty:
+            st.info("No se encontraron viajes con los filtros aplicados.")
         else:
-            if filtro_conductor:
-                df = df[df["conductor"].str.contains(filtro_conductor, case=False, na=False)]
-            if filtro_cliente:
-                df = df[df["cliente"].str.contains(filtro_cliente, case=False, na=False)]
+            total_anticipo = df_hist['valor_anticipo'].sum()
+            legalizados = df_hist['legalizado'].sum()
+            pendientes = len(df_hist) - legalizados
 
-            # Métricas resumen
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("📋 Reportes", len(df))
-            with col2:
-                st.metric("💸 Total Gastos", f"$ {fmt(df['total_gastos'].sum())}")
-            with col3:
-                st.metric("💰 Total Anticipos", f"$ {fmt(df['anticipo'].sum())}")
-            with col4:
-                res = df["resultado"].sum()
-                label = "✅ Sobrante Total" if res >= 0 else "⚠️ Faltante Total"
-                st.metric(label, f"$ {fmt(abs(res))}")
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Total viajes", len(df_hist))
+            col_m2.metric("Legalizados", int(legalizados))
+            col_m3.metric("Pendientes", int(pendientes))
+            col_m4.metric("Total anticipos", f"${fmt(total_anticipo)}")
 
-            st.divider()
+            df_show = df_hist[[
+                'id', 'fecha_viaje', 'placa', 'conductor', 'cliente',
+                'origen', 'destino', 'valor_anticipo', 'legalizado',
+                'legalizado_por', 'fecha_legalizacion'
+            ]].copy()
 
-            # Tabla resumen
-            cols_mostrar = ["id", "fecha", "cliente", "conductor", "tipo_carga",
-                            "origen", "destino", "total_gastos", "anticipo", "resultado"]
-            df_vis = df[cols_mostrar].copy()
-            df_vis.columns = ["ID", "Fecha", "Cliente", "Conductor", "Tipo Carga",
-                               "Origen", "Destino", "Total Gastos", "Anticipo", "Resultado"]
-            df_vis["Total Gastos"] = df_vis["Total Gastos"].apply(lambda x: f"$ {fmt(x)}")
-            df_vis["Anticipo"]     = df_vis["Anticipo"].apply(lambda x: f"$ {fmt(x)}")
-            df_vis["Resultado"]    = df_vis["Resultado"].apply(
-                lambda x: f"✅ $ {fmt(x)}" if x >= 0 else f"⚠️ -$ {fmt(abs(x))}"
+            df_show['valor_anticipo'] = df_show['valor_anticipo'].apply(lambda x: f"${fmt(x)}")
+            df_show['legalizado'] = df_show['legalizado'].apply(
+                lambda x: "✅ Legalizado" if x else "🔴 Pendiente"
+            )
+            df_show.columns = [
+                'ID', 'Fecha viaje', 'Placa', 'Conductor', 'Cliente',
+                'Origen', 'Destino', 'Anticipo', 'Estado',
+                'Legalizado por', 'Fecha legalización'
+            ]
+
+            st.dataframe(df_show, use_container_width=True, hide_index=True, height=400)
+
+            st.subheader("Ver detalle o eliminar viaje")
+            viaje_sel = st.selectbox(
+                "Selecciona un ID",
+                df_hist['id'].tolist(),
+                key="hist_sel"
             )
 
-            st.dataframe(df_vis, use_container_width=True, hide_index=True, height=350)
+            row_sel = df_hist[df_hist['id'] == viaje_sel].iloc[0]
 
-            st.divider()
+            col_det, col_acc = st.columns([3, 1])
+            with col_det:
+                estado_tag = "✅ **LEGALIZADO**" if row_sel['legalizado'] else "🔴 **PENDIENTE**"
+                st.markdown(f"**Estado:** {estado_tag}")
+                st.write(f"Fecha viaje: {row_sel['fecha_viaje']}")
+                st.write(f"Placa: {row_sel['placa']} | Conductor: {row_sel['conductor']}")
+                st.write(f"Cliente: {row_sel['cliente']}")
+                st.write(f"Ruta: {row_sel['origen']} → {row_sel['destino']}")
+                st.write(f"Anticipo: **${fmt(row_sel['valor_anticipo'])} COP**")
+                if row_sel.get('observaciones'):
+                    st.write(f"Observaciones: {row_sel['observaciones']}")
+                if row_sel['legalizado']:
+                    st.success(
+                        f"Legalizado por: **{row_sel['legalizado_por']}** | "
+                        f"Fecha: {row_sel['fecha_legalizacion']}"
+                    )
+                    if row_sel.get('obs_legalizacion'):
+                        st.write(f"Obs legalización: {row_sel['obs_legalizacion']}")
 
-            # Detalle + eliminar
-            st.subheader("🔎 Ver / Eliminar Reporte")
-            ids_disponibles = df["id"].tolist()
-            id_sel = st.selectbox("Selecciona ID", ids_disponibles)
-
-            col_ver, col_del = st.columns(2)
-
-            with col_ver:
-                if st.button("👁️ Ver Detalle", use_container_width=True):
-                    fila = df[df["id"] == id_sel].iloc[0]
-                    with st.expander(f"Detalle Reporte #{id_sel}", expanded=True):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"**Fecha:** {fila['fecha']}")
-                            st.write(f"**Cliente:** {fila['cliente']}")
-                            st.write(f"**Conductor:** {fila['conductor']}")
-                            st.write(f"**Tipo Carga:** {fila['tipo_carga']}")
-                            st.write(f"**Origen → Destino:** {fila['origen']} → {fila['destino']}")
-                            st.divider()
-                            st.write(f"**ACPM:** $ {fmt(fila['acpm'])}")
-                            st.write(f"**Peaje:** $ {fmt(fila['peaje'])}")
-                            st.write(f"**Carpada:** $ {fmt(fila['carpada'])}")
-                            st.write(f"**Descarpada:** $ {fmt(fila['descarpada'])}")
-                            st.write(f"**Amarre:** $ {fmt(fila['amarre'])}")
-                            st.write(f"**Desamarre:** $ {fmt(fila['desamarre'])}")
-                            st.write(f"**Comida:** $ {fmt(fila['comida'])}")
-                            st.write(f"**Transporte:** $ {fmt(fila['transporte'])}")
-                            st.write(f"**Arreglo Llantas:** $ {fmt(fila['arreglo_llantas'])}")
-                            st.write(f"**Lavado:** $ {fmt(fila['lavado'])}")
-                            st.write(f"**Parque:** $ {fmt(fila['parque'])}")
-                        with col2:
-                            st.write(f"**Reparación:** $ {fmt(fila['reparacion'])}")
-                            if fila['obs_reparacion']:
-                                st.info(f"📝 Obs. Reparación: {fila['obs_reparacion']}")
-                            st.write(f"**Repuesto:** $ {fmt(fila['repuesto'])}")
-                            st.write(f"**Hotel:** $ {fmt(fila['hotel'])}")
-                            st.write(f"**Comisión:** $ {fmt(fila['comision'])}")
-                            st.write(f"**Propina:** $ {fmt(fila['propina'])}")
-                            st.write(f"**Cambio de Cheque:** $ {fmt(fila['cambio_cheque'])}")
-                            st.write(f"**Policía / Escolta:** $ {fmt(fila['policia_escolta'])}")
-                            st.write(f"**Engrase:** $ {fmt(fila['engrase'])}")
-                            st.write(f"**Cargue:** $ {fmt(fila['cargue'])}")
-                            st.write(f"**Descargue:** $ {fmt(fila['descargue'])}")
-                            st.write(f"**Báscula:** $ {fmt(fila['bascula'])}")
-                            st.write(f"**Otros:** $ {fmt(fila['otros'])}")
-                            st.divider()
-                            st.success(f"**💸 Total Gastos:** $ {fmt(fila['total_gastos'])}")
-                            st.info(f"**💰 Anticipo:** $ {fmt(fila['anticipo'])}")
-                            res = fila['resultado']
-                            if res >= 0:
-                                st.success(f"**✅ Sobrante:** $ {fmt(res)}")
-                            else:
-                                st.error(f"**⚠️ Faltante:** $ {fmt(abs(res))}")
-
-                        # Botón descargar Excel del detalle
-                        datos_excel = {
-                            "fecha": fila["fecha"], "cliente": fila["cliente"],
-                            "conductor": fila["conductor"], "tipo_carga": fila["tipo_carga"],
-                            "origen": fila["origen"], "destino": fila["destino"],
-                            "acpm": fila["acpm"], "peaje": fila["peaje"],
-                            "carpada": fila["carpada"], "descarpada": fila["descarpada"],
-                            "amarre": fila["amarre"], "desamarre": fila["desamarre"],
-                            "comida": fila["comida"], "transporte": fila["transporte"],
-                            "arreglo_llantas": fila["arreglo_llantas"], "lavado": fila["lavado"],
-                            "parque": fila["parque"], "reparacion": fila["reparacion"],
-                            "obs_reparacion": fila["obs_reparacion"], "repuesto": fila["repuesto"],
-                            "hotel": fila["hotel"], "comision": fila["comision"],
-                            "propina": fila["propina"], "cambio_cheque": fila["cambio_cheque"],
-                            "policia_escolta": fila["policia_escolta"], "engrase": fila["engrase"],
-                            "cargue": fila["cargue"], "descargue": fila["descargue"],
-                            "bascula": fila["bascula"], "otros": fila["otros"],
-                            "total_gastos": fila["total_gastos"], "anticipo": fila["anticipo"],
-                            "resultado": fila["resultado"],
-                        }
-                        xl = generar_excel(datos_excel)
-                        st.download_button(
-                            "📥 Descargar este reporte en Excel",
-                            data=xl,
-                            file_name=f"Gastos_{fila['conductor'].replace(' ','_')}_{fila['fecha']}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-
-            with col_del:
-                if st.button("🗑️ Eliminar Reporte", type="secondary", use_container_width=True):
-                    eliminar_reporte(id_sel)
-                    st.success(f"Reporte #{id_sel} eliminado.")
+            with col_acc:
+                st.markdown("&nbsp;")
+                if st.button("🗑️ Eliminar viaje", key="btn_eliminar", type="secondary"):
+                    db.eliminar(viaje_sel)
+                    st.warning(f"Viaje ID {viaje_sel} eliminado.")
                     st.rerun()
-
 
 if __name__ == "__main__":
     main()

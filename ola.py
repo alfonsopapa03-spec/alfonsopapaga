@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = ""  # <- Pega aquí tu URL de conexión de Supabase
+SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"  # <- Pega aquí tu URL de conexión de Supabase
 
 # ==================== FORMATO COLOMBIANO ====================
 def fmt(valor):

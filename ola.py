@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v2: manifiesto obligatorio, edición, confirmación de eliminación
+v3: pestaña clientes, lista desplegable clientes, conductor auto por placa
 """
 
 import streamlit as st
@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"  # <- Pega aquí tu URL de conexión de Supabase
+SUPABASE_DB_URL = ""  # <- Pega aquí tu URL de conexión de Supabase
 
 # ==================== FORMATO COLOMBIANO ====================
 def fmt(valor):
@@ -32,19 +32,58 @@ def limpiar(texto):
 def hora_colombia():
     return datetime.utcnow() - timedelta(hours=5)
 
+# ==================== PLACAS Y CONDUCTORES ====================
+PLACAS = [
+    "NOX459", "NOX460", "NOX461", "SON047", "SON048",
+    "SOP148", "SOP149", "SOP150", "SRO661", "SRO672",
+    "TMW882", "TRL282", "TRL298", "UYQ308", "UYV084",
+    "UYY788", "PSX350"
+]
+
+PLACA_CONDUCTOR = {
+    "NOX459": "GONZALO",
+    "NOX460": "JOSE ORTEGA",
+    "NOX461": "CARLOS TAFUR",
+    "SON047": "ISAIAS VESGA",
+    "SON048": "FLAVIO MALTE",
+    "SOP148": "SHITH",
+    "SOP149": "",
+    "SOP150": "RAMON TAFUR",
+    "SRO661": "JULIAN CALETH",
+    "SRO672": "PEDRO JR",
+    "TMW882": "REIMUR MANUEL",
+    "TRL282": "CHRISTIAN MARTINEZ",
+    "TRL298": "YEIMI DUQUE",
+    "UYQ308": "",
+    "UYV084": "",
+    "UYY788": "EDUARDO OLIVARES",
+    "PSX350": "EDGAR DE JESUS",
+}
+
+# Clientes predeterminados del sistema
+CLIENTES_DEFAULT = [
+    "GLOBO EXPRESS",
+    "MOTOTRANSPORTAMOS",
+    "CARGO ANDINA",
+    "TRANSOLICAR",
+    "SUCLOGISTIC",
+]
+
 # ==================== BASE DE DATOS ====================
 class DB:
     def __init__(self):
         self.url = SUPABASE_DB_URL
-        self._init_tabla()
+        self._init_tablas()
 
     def conn(self):
         return psycopg2.connect(self.url)
 
-    def _init_tabla(self):
+    def _init_tablas(self):
         try:
             c = self.conn()
             cur = c.cursor()
+
+            # Tabla principal de anticipos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS anticipos_v1 (
                     id SERIAL PRIMARY KEY,
@@ -63,16 +102,62 @@ class DB:
                     obs_legalizacion TEXT
                 )
             """)
-            # Migración segura: agrega columna manifiesto si no existe
             cur.execute("""
                 ALTER TABLE anticipos_v1
                 ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''
             """)
+
+            # Tabla de clientes adicionales
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clientes_extra (
+                    id SERIAL PRIMARY KEY,
+                    nombre TEXT UNIQUE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+
             c.commit()
             c.close()
         except Exception as e:
-            st.error(f"Error inicializando tabla: {e}")
+            st.error(f"Error inicializando tablas: {e}")
 
+    # ---- Clientes ----
+    def obtener_clientes_extra(self):
+        try:
+            c = self.conn()
+            df = pd.read_sql_query(
+                "SELECT * FROM clientes_extra ORDER BY nombre", c
+            )
+            c.close()
+            return df
+        except:
+            return pd.DataFrame(columns=['id', 'nombre', 'fecha_registro'])
+
+    def agregar_cliente(self, nombre):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
+                (nombre.strip().upper(), hora_colombia())
+            )
+            c.commit()
+            c.close()
+            return True
+        except Exception as e:
+            return False
+
+    def eliminar_cliente(self, cliente_id):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("DELETE FROM clientes_extra WHERE id = %s", (cliente_id,))
+            c.commit()
+            c.close()
+        except Exception as e:
+            st.error(f"Error eliminando cliente: {e}")
+
+    # ---- Viajes ----
     def registrar_viaje(self, data):
         try:
             c = self.conn()
@@ -109,26 +194,14 @@ class DB:
             cur = c.cursor()
             cur.execute("""
                 UPDATE anticipos_v1 SET
-                    fecha_viaje = %s,
-                    placa = %s,
-                    conductor = %s,
-                    cliente = %s,
-                    origen = %s,
-                    destino = %s,
-                    valor_anticipo = %s,
-                    observaciones = %s,
-                    manifiesto = %s
+                    fecha_viaje = %s, placa = %s, conductor = %s, cliente = %s,
+                    origen = %s, destino = %s, valor_anticipo = %s,
+                    observaciones = %s, manifiesto = %s
                 WHERE id = %s
             """, (
-                data['fecha_viaje'],
-                data['placa'],
-                data['conductor'],
-                data['cliente'],
-                data['origen'],
-                data['destino'],
-                int(data['valor_anticipo']),
-                data.get('observaciones', ''),
-                data.get('manifiesto', '').strip().upper(),
+                data['fecha_viaje'], data['placa'], data['conductor'], data['cliente'],
+                data['origen'], data['destino'], int(data['valor_anticipo']),
+                data.get('observaciones', ''), data.get('manifiesto', '').strip().upper(),
                 viaje_id
             ))
             c.commit()
@@ -144,10 +217,8 @@ class DB:
             cur = c.cursor()
             cur.execute("""
                 UPDATE anticipos_v1
-                SET legalizado = TRUE,
-                    fecha_legalizacion = %s,
-                    legalizado_por = %s,
-                    obs_legalizacion = %s
+                SET legalizado = TRUE, fecha_legalizacion = %s,
+                    legalizado_por = %s, obs_legalizacion = %s
                 WHERE id = %s
             """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id))
             c.commit()
@@ -211,32 +282,15 @@ class DB:
         except:
             return None
 
-# ==================== PLACAS Y CONDUCTORES ====================
-PLACAS = [
-    "NOX459", "NOX460", "NOX461", "SON047", "SON048",
-    "SOP148", "SOP149", "SOP150", "SRO661", "SRO672",
-    "TMW882", "TRL282", "TRL298", "UYQ308", "UYV084",
-    "UYY788"
-]
 
-PLACA_CONDUCTOR = {
-    "NOX459": "HABID CAMACHO",
-    "NOX460": "JOSE ORTEGA PEREZ",
-    "NOX461": "ISAAC TAFUR",
-    "SON047": "ISAIAS VESGA",
-    "SON048": "FLAVIO ROSENDO MALTE TUTALCHA",
-    "SOP148": "SLITH JOSE ORTEGA PACHECO",
-    "SOP149": "ABRAHAM SEGUNDO ALVAREZ VALLE",
-    "SOP150": "RAMON TAFUR HERNANDEZ",
-    "SRO661": "",
-    "SRO672": "PEDRO VILLAMIL",
-    "TMW882": "JESUS DAVID MONTE MOSQUERA",
-    "TRL282": "CHRISTIAN MARTINEZ NAVARRO",
-    "TRL298": "YEIMI DUQUE ZULUAGA",
-    "UYQ308": "JULIAN CALETH CORONADO",
-    "UYV084": "CARLOS TAFUR",
-    "UYY788": "EDUARDO RAFAEL OLIVARES ALCAZAR",
-}
+# ==================== HELPER: lista completa de clientes ====================
+def get_lista_clientes(db):
+    """Combina clientes default + clientes extra de la BD, ordenados"""
+    extras_df = db.obtener_clientes_extra()
+    extras = extras_df['nombre'].tolist() if not extras_df.empty else []
+    todos = sorted(set(CLIENTES_DEFAULT + extras))
+    return todos
+
 
 # ==================== APP PRINCIPAL ====================
 def main():
@@ -254,32 +308,46 @@ def main():
         st.session_state.confirmar_eliminar = None
     if 'editando_id' not in st.session_state:
         st.session_state.editando_id = None
+    if 'confirmar_eliminar_cliente' not in st.session_state:
+        st.session_state.confirmar_eliminar_cliente = None
 
     db = st.session_state.db
 
-    tab_reg, tab_leg, tab_hist = st.tabs([
+    tab_reg, tab_leg, tab_hist, tab_clientes = st.tabs([
         "📝 Registrar Viaje",
         "✅ Legalizar Anticipos",
-        "📋 Historial"
+        "📋 Historial",
+        "🏢 Clientes"
     ])
 
     # ==================== TAB 1: REGISTRAR ====================
     with tab_reg:
         st.header("Registrar nuevo viaje con anticipo")
 
+        lista_clientes = get_lista_clientes(db)
+
         with st.form("form_registro", clear_on_submit=True):
             col1, col2 = st.columns(2)
 
             with col1:
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
+
                 placa = st.selectbox("Placa de la tractomula", PLACAS)
                 conductor_auto = PLACA_CONDUCTOR.get(placa, "")
-                conductor = st.text_input(
-                    "Conductor",
+                # Conductor solo lectura: se muestra el asignado a la placa
+                st.text_input(
+                    "Conductor (asignado automáticamente)",
                     value=conductor_auto,
-                    help="Se asigna automáticamente según la placa"
+                    disabled=True,
+                    help="El conductor se asigna automáticamente según la placa seleccionada"
                 )
-                cliente = st.text_input("Cliente", placeholder="Nombre del cliente")
+
+                cliente = st.selectbox(
+                    "Cliente",
+                    lista_clientes,
+                    help="Si no aparece el cliente, agrégalo en la pestaña 🏢 Clientes"
+                )
+
                 manifiesto = st.text_input(
                     "Número de manifiesto ✱",
                     placeholder="Ej: 1234567",
@@ -305,13 +373,10 @@ def main():
             submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
 
             if submitted:
+                conductor_final = PLACA_CONDUCTOR.get(placa, "")
                 errores = []
                 if not manifiesto.strip():
                     errores.append("El número de manifiesto es obligatorio")
-                if not conductor.strip():
-                    errores.append("Conductor es obligatorio")
-                if not cliente.strip():
-                    errores.append("Cliente es obligatorio")
                 if not origen.strip():
                     errores.append("Origen es obligatorio")
                 if not destino.strip():
@@ -326,7 +391,7 @@ def main():
                     nuevo_id = db.registrar_viaje({
                         'fecha_viaje': fecha_viaje,
                         'placa': placa,
-                        'conductor': conductor.strip().upper(),
+                        'conductor': conductor_final.strip().upper(),
                         'cliente': cliente.strip().upper(),
                         'origen': origen.strip().upper(),
                         'destino': destino.strip().upper(),
@@ -339,7 +404,7 @@ def main():
 ✅ **Viaje registrado exitosamente (ID: {nuevo_id})**
 
 - Manifiesto: **{manifiesto.strip().upper()}**
-- Placa: {placa} | Conductor: {conductor.upper()}
+- Placa: {placa} | Conductor: {conductor_final.upper() or '(sin asignar)'}
 - Ruta: {origen.upper()} → {destino.upper()}
 - Cliente: {cliente.upper()}
 - Anticipo: **${fmt(anticipo)} COP**
@@ -363,10 +428,10 @@ def main():
                 "Buscar por manifiesto", placeholder="Nº manifiesto...", key="leg_manif"
             )
 
-        fi = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
-        ff = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
-        pl = None if placa_leg == "Todas" else placa_leg
-        mf = manifiesto_leg.strip() if manifiesto_leg else None
+        fi  = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
+        ff  = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
+        pl  = None if placa_leg == "Todas" else placa_leg
+        mf  = manifiesto_leg.strip() if manifiesto_leg else None
 
         df_pendientes = db.buscar(
             estado="pendiente", fecha_ini=fi, fecha_fin=ff, placa=pl, manifiesto=mf
@@ -439,9 +504,7 @@ def main():
         col1, col2, col3 = st.columns(3)
         with col1:
             estado_filtro = st.selectbox(
-                "Estado",
-                ["Todos", "Pendientes", "Legalizados"],
-                key="hist_estado"
+                "Estado", ["Todos", "Pendientes", "Legalizados"], key="hist_estado"
             )
         with col2:
             fecha_ini_h = st.date_input("Desde", value=None, key="hist_fi")
@@ -461,15 +524,15 @@ def main():
             )
 
         estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
-        estado_q = estado_map[estado_filtro]
-        fi_h = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
-        ff_h = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
-        pl_h = None if placa_h == "Todas" else placa_h
+        fi_h  = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
+        ff_h  = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
+        pl_h  = None if placa_h == "Todas" else placa_h
         cond_h = conductor_h if conductor_h else None
-        mf_h = manifiesto_h.strip() if manifiesto_h else None
+        mf_h  = manifiesto_h.strip() if manifiesto_h else None
 
         df_hist = db.buscar(
-            estado=estado_q, fecha_ini=fi_h, fecha_fin=ff_h,
+            estado=estado_map[estado_filtro],
+            fecha_ini=fi_h, fecha_fin=ff_h,
             placa=pl_h, conductor=cond_h, manifiesto=mf_h
         )
 
@@ -477,8 +540,8 @@ def main():
             st.info("No se encontraron viajes con los filtros aplicados.")
         else:
             total_anticipo = df_hist['valor_anticipo'].sum()
-            legalizados = int(df_hist['legalizado'].sum())
-            pendientes = len(df_hist) - legalizados
+            legalizados    = int(df_hist['legalizado'].sum())
+            pendientes     = len(df_hist) - legalizados
 
             col_m1, col_m2, col_m3, col_m4 = st.columns(4)
             col_m1.metric("Total viajes", len(df_hist))
@@ -491,8 +554,8 @@ def main():
                 'origen', 'destino', 'valor_anticipo', 'legalizado',
                 'legalizado_por', 'fecha_legalizacion'
             ]
-            cols_existentes = [c for c in cols_tabla if c in df_hist.columns]
-            df_show = df_hist[cols_existentes].copy()
+            cols_ok = [c for c in cols_tabla if c in df_hist.columns]
+            df_show = df_hist[cols_ok].copy()
             df_show['valor_anticipo'] = df_show['valor_anticipo'].apply(lambda x: f"${fmt(x)}")
             df_show['legalizado'] = df_show['legalizado'].apply(
                 lambda x: "✅ Legalizado" if x else "🔴 Pendiente"
@@ -546,15 +609,12 @@ def main():
 
             with col_acc:
                 st.markdown("&nbsp;")
-
-                # Botón editar
                 if st.button("✏️ Editar viaje", key="btn_editar"):
                     st.session_state.editando_id = viaje_sel
                     st.rerun()
 
                 st.markdown("&nbsp;")
 
-                # Eliminar con confirmación de dos pasos
                 if st.session_state.confirmar_eliminar == viaje_sel:
                     st.warning(f"¿Seguro que quieres eliminar el viaje ID **{viaje_sel}**?")
                     col_si, col_no = st.columns(2)
@@ -573,7 +633,7 @@ def main():
                         st.session_state.confirmar_eliminar = viaje_sel
                         st.rerun()
 
-        # ==================== FORMULARIO DE EDICIÓN ====================
+        # ---- Formulario de edición ----
         if st.session_state.editando_id is not None:
             eid = st.session_state.editando_id
             viaje_edit = db.obtener_por_id(eid)
@@ -585,6 +645,12 @@ def main():
                     f"Manifiesto: {viaje_edit.get('manifiesto','—')}"
                 )
 
+                lista_clientes_edit = get_lista_clientes(db)
+                cliente_actual = viaje_edit['cliente']
+                if cliente_actual not in lista_clientes_edit:
+                    lista_clientes_edit = [cliente_actual] + lista_clientes_edit
+                idx_cliente = lista_clientes_edit.index(cliente_actual)
+
                 with st.form(f"form_editar_{eid}"):
                     col1, col2 = st.columns(2)
 
@@ -595,8 +661,15 @@ def main():
                         )
                         idx_placa = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
                         placa_e = st.selectbox("Placa", PLACAS, index=idx_placa)
-                        conductor_e = st.text_input("Conductor", value=viaje_edit['conductor'])
-                        cliente_e = st.text_input("Cliente", value=viaje_edit['cliente'])
+                        conductor_e_val = PLACA_CONDUCTOR.get(placa_e, viaje_edit['conductor'])
+                        st.text_input(
+                            "Conductor (automático)",
+                            value=conductor_e_val,
+                            disabled=True
+                        )
+                        cliente_e = st.selectbox(
+                            "Cliente", lista_clientes_edit, index=idx_cliente
+                        )
                         manifiesto_e = st.text_input(
                             "Número de manifiesto ✱",
                             value=viaje_edit.get('manifiesto', '') or '',
@@ -626,13 +699,10 @@ def main():
                         cancelar_edit = st.form_submit_button("✖ Cancelar")
 
                     if guardar_edit:
+                        conductor_edit_final = PLACA_CONDUCTOR.get(placa_e, viaje_edit['conductor'])
                         errores_e = []
                         if not manifiesto_e.strip():
                             errores_e.append("El número de manifiesto es obligatorio")
-                        if not conductor_e.strip():
-                            errores_e.append("Conductor es obligatorio")
-                        if not cliente_e.strip():
-                            errores_e.append("Cliente es obligatorio")
                         if not origen_e.strip():
                             errores_e.append("Origen es obligatorio")
                         if not destino_e.strip():
@@ -647,7 +717,7 @@ def main():
                             ok = db.editar_viaje(eid, {
                                 'fecha_viaje': fecha_e,
                                 'placa': placa_e,
-                                'conductor': conductor_e.strip().upper(),
+                                'conductor': conductor_edit_final.strip().upper(),
                                 'cliente': cliente_e.strip().upper(),
                                 'origen': origen_e.strip().upper(),
                                 'destino': destino_e.strip().upper(),
@@ -663,6 +733,86 @@ def main():
                     if cancelar_edit:
                         st.session_state.editando_id = None
                         st.rerun()
+
+    # ==================== TAB 4: CLIENTES ====================
+    with tab_clientes:
+        st.header("🏢 Gestión de Clientes")
+        st.markdown(
+            "Agrega aquí los clientes adicionales. "
+            "Los clientes predeterminados siempre estarán disponibles."
+        )
+
+        # Clientes predeterminados (solo lectura)
+        st.subheader("Clientes predeterminados")
+        cols = st.columns(len(CLIENTES_DEFAULT))
+        for i, c_def in enumerate(CLIENTES_DEFAULT):
+            with cols[i]:
+                st.info(c_def)
+
+        st.divider()
+
+        # Agregar cliente nuevo
+        st.subheader("Agregar cliente nuevo")
+        with st.form("form_nuevo_cliente", clear_on_submit=True):
+            nuevo_cliente = st.text_input(
+                "Nombre del cliente",
+                placeholder="Ej: LOGÍSTICA DEL NORTE"
+            )
+            agregar_btn = st.form_submit_button("➕ Agregar Cliente", type="primary")
+
+            if agregar_btn:
+                if not nuevo_cliente.strip():
+                    st.error("⚠️ El nombre del cliente no puede estar vacío.")
+                elif nuevo_cliente.strip().upper() in [c.upper() for c in CLIENTES_DEFAULT]:
+                    st.warning("⚠️ Ese cliente ya existe en la lista predeterminada.")
+                else:
+                    ok = db.agregar_cliente(nuevo_cliente.strip())
+                    if ok:
+                        st.success(f"✅ Cliente **{nuevo_cliente.strip().upper()}** agregado correctamente.")
+                        st.rerun()
+                    else:
+                        st.error("❌ Ese cliente ya existe o hubo un error al guardarlo.")
+
+        st.divider()
+
+        # Clientes adicionales guardados
+        st.subheader("Clientes adicionales registrados")
+        df_extras = db.obtener_clientes_extra()
+
+        if df_extras.empty:
+            st.info("No hay clientes adicionales registrados aún.")
+        else:
+            for _, row in df_extras.iterrows():
+                col_nombre, col_fecha, col_btn = st.columns([3, 2, 1])
+                with col_nombre:
+                    st.write(f"**{row['nombre']}**")
+                with col_fecha:
+                    st.write(f"Registrado: {str(row['fecha_registro'])[:16]}")
+                with col_btn:
+                    if st.session_state.confirmar_eliminar_cliente == row['id']:
+                        st.warning("¿Eliminar?")
+                        c_si, c_no = st.columns(2)
+                        with c_si:
+                            if st.button("Sí", key=f"si_cli_{row['id']}"):
+                                db.eliminar_cliente(row['id'])
+                                st.session_state.confirmar_eliminar_cliente = None
+                                st.success(f"Cliente eliminado.")
+                                st.rerun()
+                        with c_no:
+                            if st.button("No", key=f"no_cli_{row['id']}"):
+                                st.session_state.confirmar_eliminar_cliente = None
+                                st.rerun()
+                    else:
+                        if st.button("🗑️", key=f"del_cli_{row['id']}"):
+                            st.session_state.confirmar_eliminar_cliente = row['id']
+                            st.rerun()
+
+        st.divider()
+        st.subheader("Lista completa disponible en el sistema")
+        todos = get_lista_clientes(db)
+        for c in todos:
+            st.write(f"• {c}")
+
 
 if __name__ == "__main__":
     main()

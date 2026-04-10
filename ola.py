@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v4: fix conductor automático por placa en registro Y edición
+v5: fix conductor siempre sincronizado con placa via session_state
 """
 
 import streamlit as st
@@ -60,7 +60,6 @@ PLACA_CONDUCTOR = {
     "PSX350": "EDGAR DE JESUS",
 }
 
-# Clientes predeterminados del sistema
 CLIENTES_DEFAULT = [
     "GLOBO EXPRESS",
     "MOTOTRANSPORTAMOS",
@@ -116,7 +115,6 @@ class DB:
         except Exception as e:
             st.error(f"Error inicializando tablas: {e}")
 
-    # ---- Clientes ----
     def obtener_clientes_extra(self):
         try:
             c = self.conn()
@@ -150,7 +148,6 @@ class DB:
         except Exception as e:
             st.error(f"Error eliminando cliente: {e}")
 
-    # ---- Viajes ----
     def registrar_viaje(self, data):
         try:
             c = self.conn()
@@ -276,7 +273,7 @@ class DB:
             return None
 
 
-# ==================== HELPER: lista completa de clientes ====================
+# ==================== HELPER ====================
 def get_lista_clientes(db):
     extras_df = db.obtener_clientes_extra()
     extras = extras_df['nombre'].tolist() if not extras_df.empty else []
@@ -318,16 +315,18 @@ def main():
 
         lista_clientes = get_lista_clientes(db)
 
-        # ── Placa y conductor FUERA del form para actualización en tiempo real ──
+        # Placa y conductor FUERA del form — se leen siempre desde session_state
         col_pre1, col_pre2 = st.columns(2)
         with col_pre1:
-            placa_sel = st.selectbox(
+            st.selectbox(
                 "Placa de la tractomula",
                 PLACAS,
-                key="reg_placa"
+                key="reg_placa"          # <-- el valor vive en session_state
             )
         with col_pre2:
-            conductor_mostrado = PLACA_CONDUCTOR.get(placa_sel, "")
+            # ✅ Leer SIEMPRE desde session_state para garantizar sincronía
+            placa_actual = st.session_state.get("reg_placa", PLACAS[0])
+            conductor_mostrado = PLACA_CONDUCTOR.get(placa_actual, "")
             st.text_input(
                 "Conductor (automático)",
                 value=conductor_mostrado if conductor_mostrado else "Sin conductor asignado",
@@ -372,9 +371,10 @@ def main():
             submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
 
             if submitted:
-                # Leer placa y conductor del session_state (definidos fuera del form)
+                # Leer placa y conductor desde session_state
                 placa = st.session_state.get("reg_placa", PLACAS[0])
                 conductor_final = PLACA_CONDUCTOR.get(placa, "")
+
                 errores = []
                 if not manifiesto.strip():
                     errores.append("El número de manifiesto es obligatorio")
@@ -429,10 +429,10 @@ def main():
                 "Buscar por manifiesto", placeholder="Nº manifiesto...", key="leg_manif"
             )
 
-        fi  = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
-        ff  = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
-        pl  = None if placa_leg == "Todas" else placa_leg
-        mf  = manifiesto_leg.strip() if manifiesto_leg else None
+        fi = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
+        ff = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
+        pl = None if placa_leg == "Todas" else placa_leg
+        mf = manifiesto_leg.strip() if manifiesto_leg else None
 
         df_pendientes = db.buscar(
             estado="pendiente", fecha_ini=fi, fecha_fin=ff, placa=pl, manifiesto=mf
@@ -612,8 +612,6 @@ def main():
                 st.markdown("&nbsp;")
                 if st.button("✏️ Editar viaje", key="btn_editar"):
                     st.session_state.editando_id = viaje_sel
-                    # Inicializar la placa del editor con la placa del viaje seleccionado
-                    st.session_state.edit_placa_actual = row_sel['placa']
                     st.rerun()
 
                 st.markdown("&nbsp;")
@@ -654,19 +652,21 @@ def main():
                     lista_clientes_edit = [cliente_actual] + lista_clientes_edit
                 idx_cliente = lista_clientes_edit.index(cliente_actual)
 
-                # ── PLACA Y CONDUCTOR FUERA DEL FORM para actualización reactiva ──
                 idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
 
+                # Placa y conductor FUERA del form — leídos desde session_state
                 col_pre_e1, col_pre_e2 = st.columns(2)
                 with col_pre_e1:
-                    placa_e = st.selectbox(
+                    st.selectbox(
                         "Placa de la tractomula",
                         PLACAS,
                         index=idx_placa_edit,
-                        key="edit_placa"   # <-- key única para el editor
+                        key="edit_placa"      # valor vive en session_state
                     )
                 with col_pre_e2:
-                    conductor_edit_display = PLACA_CONDUCTOR.get(placa_e, "")
+                    # ✅ Leer SIEMPRE desde session_state
+                    placa_edit_actual = st.session_state.get("edit_placa", PLACAS[0])
+                    conductor_edit_display = PLACA_CONDUCTOR.get(placa_edit_actual, "")
                     st.text_input(
                         "Conductor (automático)",
                         value=conductor_edit_display if conductor_edit_display else "Sin conductor asignado",
@@ -674,7 +674,6 @@ def main():
                         key="edit_conductor_display"
                     )
 
-                # ── Resto del formulario (sin placa ni conductor) ──
                 with st.form(f"form_editar_{eid}"):
                     col1, col2 = st.columns(2)
 
@@ -715,7 +714,7 @@ def main():
                         cancelar_edit = st.form_submit_button("✖ Cancelar")
 
                     if guardar_edit:
-                        # Leer placa desde session_state (definida FUERA del form)
+                        # ✅ Leer placa desde session_state (definida fuera del form)
                         placa_guardada = st.session_state.get("edit_placa", PLACAS[0])
                         conductor_edit_final = PLACA_CONDUCTOR.get(placa_guardada, "")
 

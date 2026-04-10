@@ -326,21 +326,30 @@ def main():
 
         lista_clientes = get_lista_clientes(db)
 
+        # ── Placa y conductor FUERA del form para actualización en tiempo real ──
+        col_pre1, col_pre2 = st.columns(2)
+        with col_pre1:
+            placa_sel = st.selectbox(
+                "Placa de la tractomula",
+                PLACAS,
+                key="reg_placa"
+            )
+        with col_pre2:
+            conductor_mostrado = PLACA_CONDUCTOR.get(placa_sel, "")
+            st.text_input(
+                "Conductor (automático)",
+                value=conductor_mostrado if conductor_mostrado else "Sin conductor asignado",
+                disabled=True,
+                key="reg_conductor_display"
+            )
+
+        st.divider()
+
         with st.form("form_registro", clear_on_submit=True):
             col1, col2 = st.columns(2)
 
             with col1:
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
-
-                placa = st.selectbox("Placa de la tractomula", PLACAS)
-                conductor_auto = PLACA_CONDUCTOR.get(placa, "")
-                # Conductor solo lectura: se muestra el asignado a la placa
-                st.text_input(
-                    "Conductor (asignado automáticamente)",
-                    value=conductor_auto,
-                    disabled=True,
-                    help="El conductor se asigna automáticamente según la placa seleccionada"
-                )
 
                 cliente = st.selectbox(
                     "Cliente",
@@ -373,6 +382,8 @@ def main():
             submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
 
             if submitted:
+                # Leer placa y conductor del session_state (definidos fuera del form)
+                placa       = st.session_state.get("reg_placa", PLACAS[0])
                 conductor_final = PLACA_CONDUCTOR.get(placa, "")
                 errores = []
                 if not manifiesto.strip():

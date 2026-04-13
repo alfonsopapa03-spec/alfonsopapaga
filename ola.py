@@ -1,13 +1,17 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v7: gestión dinámica de conductores (agregar / editar / eliminar)
+v8: alertas de vencimiento + exportar a Excel
 """
 
 import streamlit as st
 import psycopg2
 import pandas as pd
 from datetime import datetime, timedelta
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # ==================== CONFIGURACIÓN ====================
 SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
@@ -32,6 +36,188 @@ def limpiar(texto):
 def hora_colombia():
     return datetime.utcnow() - timedelta(hours=5)
 
+# ==================== ALERTAS ====================
+def clasificar_alerta(fecha_viaje):
+    """Retorna (dias, nivel) donde nivel es 'ok', 'warning' o 'critical'"""
+    hoy = hora_colombia().date()
+    try:
+        if hasattr(fecha_viaje, 'date'):
+            fv = fecha_viaje.date()
+        else:
+            fv = pd.to_datetime(fecha_viaje).date()
+    except:
+        return 0, "ok"
+    dias = (hoy - fv).days
+    if dias <= 3:
+        return dias, "ok"
+    elif dias <= 7:
+        return dias, "warning"
+    else:
+        return dias, "critical"
+
+def badge_alerta(dias, nivel):
+    if nivel == "critical":
+        return f"🔴 {dias}d"
+    elif nivel == "warning":
+        return f"🟡 {dias}d"
+    else:
+        return f"🟢 {dias}d"
+
+# ==================== EXPORTAR EXCEL ====================
+def generar_excel(df: pd.DataFrame, titulo: str = "Anticipos") -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Anticipos"
+
+    # Estilos
+    color_header    = "1F4E79"
+    color_critico   = "FCE4EC"
+    color_warning   = "FFF9C4"
+    color_ok        = "E8F5E9"
+    color_leg       = "E3F2FD"
+    color_subtotal  = "BBDEFB"
+
+    font_header  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    font_titulo  = Font(name="Arial", bold=True, size=13, color="1F4E79")
+    font_normal  = Font(name="Arial", size=9)
+    font_bold    = Font(name="Arial", bold=True, size=9)
+    font_red     = Font(name="Arial", bold=True, size=9, color="C62828")
+    font_subtot  = Font(name="Arial", bold=True, size=10, color="1F4E79")
+
+    thin = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left   = Alignment(horizontal="left",   vertical="center")
+
+    # Título
+    ws.merge_cells("A1:M1")
+    ws["A1"] = f"Reporte de Anticipos — {titulo}"
+    ws["A1"].font = font_titulo
+    ws["A1"].alignment = center
+
+    ws.merge_cells("A2:M2")
+    ws["A2"] = f"Generado: {hora_colombia().strftime('%d/%m/%Y %H:%M')} (hora Colombia)"
+    ws["A2"].font = Font(name="Arial", size=9, italic=True, color="757575")
+    ws["A2"].alignment = center
+
+    # Encabezados
+    columnas = [
+        "ID", "Manifiesto", "Fecha viaje", "Placa", "Conductor",
+        "Cliente", "Origen", "Destino", "Anticipo (COP)",
+        "Estado", "Días pend.", "Legalizado por", "Fecha legalización"
+    ]
+    row_header = 4
+    for col_idx, col_name in enumerate(columnas, start=1):
+        cell = ws.cell(row=row_header, column=col_idx, value=col_name)
+        cell.font = font_header
+        cell.fill = PatternFill("solid", fgColor=color_header)
+        cell.alignment = center
+        cell.border = border
+
+    # Datos
+    col_map = {
+        "ID": "id", "Manifiesto": "manifiesto", "Fecha viaje": "fecha_viaje",
+        "Placa": "placa", "Conductor": "conductor", "Cliente": "cliente",
+        "Origen": "origen", "Destino": "destino", "Anticipo (COP)": "valor_anticipo",
+        "Estado": "legalizado", "Legalizado por": "legalizado_por",
+        "Fecha legalización": "fecha_legalizacion"
+    }
+
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=row_header + 1):
+        legalizado = bool(row.get("legalizado", False))
+        dias, nivel = clasificar_alerta(row.get("fecha_viaje"))
+
+        if legalizado:
+            row_color = color_leg
+        elif nivel == "critical":
+            row_color = color_critico
+        elif nivel == "warning":
+            row_color = color_warning
+        else:
+            row_color = color_ok
+
+        fill = PatternFill("solid", fgColor=row_color)
+
+        valores = [
+            row.get("id", ""),
+            row.get("manifiesto", ""),
+            str(row.get("fecha_viaje", ""))[:10],
+            row.get("placa", ""),
+            row.get("conductor", ""),
+            row.get("cliente", ""),
+            row.get("origen", ""),
+            row.get("destino", ""),
+            int(row.get("valor_anticipo", 0)),
+            "✅ Legalizado" if legalizado else "🔴 Pendiente",
+            "" if legalizado else dias,
+            row.get("legalizado_por", "") or "",
+            str(row.get("fecha_legalizacion", "") or "")[:16],
+        ]
+
+        for col_idx, valor in enumerate(valores, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=valor)
+            cell.fill = fill
+            cell.border = border
+            cell.alignment = center if col_idx in [1, 10, 11] else left
+            # Anticipo en rojo si crítico y pendiente
+            if col_idx == 9 and not legalizado and nivel == "critical":
+                cell.font = font_red
+            elif col_idx == 9:
+                cell.font = font_bold
+            else:
+                cell.font = font_normal
+
+    # Fila de totales
+    total_row = row_header + len(df) + 2
+    ws.cell(row=total_row, column=8, value="TOTAL ANTICIPOS:").font = font_subtot
+    ws.cell(row=total_row, column=8).alignment = Alignment(horizontal="right")
+    ws.cell(row=total_row, column=9,
+            value=f'=SUM(I{row_header+1}:I{row_header+len(df)})').font = font_subtot
+    ws.cell(row=total_row, column=9).fill = PatternFill("solid", fgColor=color_subtotal)
+    ws.cell(row=total_row, column=9).border = border
+    ws.cell(row=total_row, column=9).alignment = center
+
+    pendientes_row = total_row + 1
+    ws.cell(row=pendientes_row, column=8, value="PENDIENTES:").font = font_subtot
+    ws.cell(row=pendientes_row, column=8).alignment = Alignment(horizontal="right")
+    ws.cell(row=pendientes_row, column=9,
+            value=f'=COUNTIF(J{row_header+1}:J{row_header+len(df)},"🔴 Pendiente")').font = font_subtot
+    ws.cell(row=pendientes_row, column=9).border = border
+    ws.cell(row=pendientes_row, column=9).alignment = center
+
+    # Leyenda
+    leyenda_row = total_row + 3
+    ws.cell(row=leyenda_row, column=1, value="Leyenda de colores:").font = font_bold
+    leyendas = [
+        (color_ok,      "Sin alerta (0-3 días)"),
+        (color_warning, "Atención (4-7 días)"),
+        (color_critico, "Crítico (+7 días)"),
+        (color_leg,     "Legalizado"),
+    ]
+    for i, (color, texto) in enumerate(leyendas):
+        c = ws.cell(row=leyenda_row + 1 + i, column=1, value=texto)
+        c.fill = PatternFill("solid", fgColor=color)
+        c.font = font_normal
+        c.border = border
+        c.alignment = left
+
+    # Anchos de columna
+    anchos = [6, 14, 13, 10, 22, 20, 18, 18, 18, 16, 10, 22, 20]
+    for col_idx, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = ancho
+
+    # Formato de moneda en columna Anticipo
+    for row_idx in range(row_header + 1, row_header + len(df) + 1):
+        ws.cell(row=row_idx, column=9).number_format = '#,##0'
+
+    # Congelar encabezado
+    ws.freeze_panes = f"A{row_header + 1}"
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
 # ==================== PLACAS ====================
 PLACAS = [
     "NOX459", "NOX460", "NOX461", "SON047", "SON048",
@@ -40,31 +226,16 @@ PLACAS = [
     "UYY788", "PSX350"
 ]
 
-# Conductores predeterminados (no se pueden eliminar)
 CONDUCTORES_DEFAULT = [
-    "CARLOS TAFUR",
-    "CHRISTIAN MARTINEZ",
-    "EDGAR DE JESUS",
-    "EDUARDO OLIVARES",
-    "FLAVIO MALTE",
-    "GONZALO",
-    "ISAIAS VESGA",
-    "JOSE ORTEGA",
-    "JULIAN CALETH",
-    "PEDRO JR",
-    "RAMON TAFUR",
-    "REIMUR MANUEL",
-    "SLITH ORTEGA",
-    "YEIMI DUQUE",
-    "SIN CONDUCTOR ASIGNADO",
+    "CARLOS TAFUR", "CHRISTIAN MARTINEZ", "EDGAR DE JESUS",
+    "EDUARDO OLIVARES", "FLAVIO MALTE", "GONZALO", "ISAIAS VESGA",
+    "JOSE ORTEGA", "JULIAN CALETH", "PEDRO JR", "RAMON TAFUR",
+    "REIMUR MANUEL", "SLITH ORTEGA", "YEIMI DUQUE", "SIN CONDUCTOR ASIGNADO",
 ]
 
 CLIENTES_DEFAULT = [
-    "GLOBO EXPRESS",
-    "MOTOTRANSPORTAMOS",
-    "CARGO ANDINA",
-    "TRANSOLICAR",
-    "SUCLOGISTIC",
+    "GLOBO EXPRESS", "MOTOTRANSPORTAMOS", "CARGO ANDINA",
+    "TRANSOLICAR", "SUCLOGISTIC",
 ]
 
 # ==================== BASE DE DATOS ====================
@@ -98,10 +269,7 @@ class DB:
                     obs_legalizacion TEXT
                 )
             """)
-            cur.execute("""
-                ALTER TABLE anticipos_v1
-                ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''
-            """)
+            cur.execute("ALTER TABLE anticipos_v1 ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS clientes_extra (
                     id SERIAL PRIMARY KEY,
@@ -109,7 +277,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # NUEVA TABLA: conductores adicionales
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS conductores_extra (
                     id SERIAL PRIMARY KEY,
@@ -122,7 +289,6 @@ class DB:
         except Exception as e:
             st.error(f"Error inicializando tablas: {e}")
 
-    # -------- CLIENTES --------
     def obtener_clientes_extra(self):
         try:
             c = self.conn()
@@ -136,27 +302,21 @@ class DB:
         try:
             c = self.conn()
             cur = c.cursor()
-            cur.execute(
-                "INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
-                (nombre.strip().upper(), hora_colombia())
-            )
-            c.commit()
-            c.close()
+            cur.execute("INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
+                        (nombre.strip().upper(), hora_colombia()))
+            c.commit(); c.close()
             return True
         except:
             return False
 
     def eliminar_cliente(self, cliente_id):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("DELETE FROM clientes_extra WHERE id = %s", (cliente_id,))
-            c.commit()
-            c.close()
+            c.commit(); c.close()
         except Exception as e:
             st.error(f"Error eliminando cliente: {e}")
 
-    # -------- CONDUCTORES --------
     def obtener_conductores_extra(self):
         try:
             c = self.conn()
@@ -168,28 +328,20 @@ class DB:
 
     def agregar_conductor(self, nombre):
         try:
-            c = self.conn()
-            cur = c.cursor()
-            cur.execute(
-                "INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
-                (nombre.strip().upper(), hora_colombia())
-            )
-            c.commit()
-            c.close()
+            c = self.conn(); cur = c.cursor()
+            cur.execute("INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
+                        (nombre.strip().upper(), hora_colombia()))
+            c.commit(); c.close()
             return True
         except:
             return False
 
     def editar_conductor(self, conductor_id, nombre_nuevo):
         try:
-            c = self.conn()
-            cur = c.cursor()
-            cur.execute(
-                "UPDATE conductores_extra SET nombre = %s WHERE id = %s",
-                (nombre_nuevo.strip().upper(), conductor_id)
-            )
-            c.commit()
-            c.close()
+            c = self.conn(); cur = c.cursor()
+            cur.execute("UPDATE conductores_extra SET nombre = %s WHERE id = %s",
+                        (nombre_nuevo.strip().upper(), conductor_id))
+            c.commit(); c.close()
             return True
         except Exception as e:
             st.error(f"Error editando conductor: {e}")
@@ -197,40 +349,28 @@ class DB:
 
     def eliminar_conductor(self, conductor_id):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("DELETE FROM conductores_extra WHERE id = %s", (conductor_id,))
-            c.commit()
-            c.close()
+            c.commit(); c.close()
         except Exception as e:
             st.error(f"Error eliminando conductor: {e}")
 
-    # -------- VIAJES --------
     def registrar_viaje(self, data):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("""
                 INSERT INTO anticipos_v1
                 (fecha_viaje, fecha_registro, placa, conductor, cliente,
                  origen, destino, valor_anticipo, observaciones, manifiesto, legalizado)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE) RETURNING id
             """, (
-                data['fecha_viaje'],
-                hora_colombia(),
-                data['placa'],
-                data['conductor'],
-                data['cliente'],
-                data['origen'],
-                data['destino'],
-                int(data['valor_anticipo']),
-                data.get('observaciones', ''),
+                data['fecha_viaje'], hora_colombia(), data['placa'], data['conductor'],
+                data['cliente'], data['origen'], data['destino'],
+                int(data['valor_anticipo']), data.get('observaciones', ''),
                 data.get('manifiesto', '').strip().upper()
             ))
             nuevo_id = cur.fetchone()[0]
-            c.commit()
-            c.close()
+            c.commit(); c.close()
             return nuevo_id
         except Exception as e:
             st.error(f"Error guardando viaje: {e}")
@@ -238,8 +378,7 @@ class DB:
 
     def editar_viaje(self, viaje_id, data):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("""
                 UPDATE anticipos_v1 SET
                     fecha_viaje = %s, placa = %s, conductor = %s, cliente = %s,
@@ -252,8 +391,7 @@ class DB:
                 data.get('observaciones', ''), data.get('manifiesto', '').strip().upper(),
                 viaje_id
             ))
-            c.commit()
-            c.close()
+            c.commit(); c.close()
             return True
         except Exception as e:
             st.error(f"Error editando viaje: {e}")
@@ -261,16 +399,14 @@ class DB:
 
     def legalizar(self, viaje_id, nombre_quien_legaliza, obs_legalizacion=""):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("""
                 UPDATE anticipos_v1
                 SET legalizado = TRUE, fecha_legalizacion = %s,
                     legalizado_por = %s, obs_legalizacion = %s
                 WHERE id = %s
             """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id))
-            c.commit()
-            c.close()
+            c.commit(); c.close()
             return True
         except Exception as e:
             st.error(f"Error legalizando: {e}")
@@ -287,20 +423,15 @@ class DB:
             elif estado == "pendiente":
                 q += " AND legalizado = FALSE"
             if fecha_ini:
-                q += " AND fecha_viaje >= %s"
-                params.append(fecha_ini)
+                q += " AND fecha_viaje >= %s"; params.append(fecha_ini)
             if fecha_fin:
-                q += " AND fecha_viaje <= %s"
-                params.append(fecha_fin)
+                q += " AND fecha_viaje <= %s"; params.append(fecha_fin)
             if placa:
-                q += " AND placa = %s"
-                params.append(placa)
+                q += " AND placa = %s"; params.append(placa)
             if conductor:
-                q += " AND conductor ILIKE %s"
-                params.append(f"%{conductor}%")
+                q += " AND conductor ILIKE %s"; params.append(f"%{conductor}%")
             if manifiesto:
-                q += " AND manifiesto ILIKE %s"
-                params.append(f"%{manifiesto}%")
+                q += " AND manifiesto ILIKE %s"; params.append(f"%{manifiesto}%")
             q += " ORDER BY fecha_registro DESC"
             df = pd.read_sql_query(q, c, params=params)
             c.close()
@@ -311,20 +442,16 @@ class DB:
 
     def eliminar(self, viaje_id):
         try:
-            c = self.conn()
-            cur = c.cursor()
+            c = self.conn(); cur = c.cursor()
             cur.execute("DELETE FROM anticipos_v1 WHERE id = %s", (viaje_id,))
-            c.commit()
-            c.close()
+            c.commit(); c.close()
         except Exception as e:
             st.error(f"Error eliminando: {e}")
 
     def obtener_por_id(self, viaje_id):
         try:
             c = self.conn()
-            df = pd.read_sql_query(
-                "SELECT * FROM anticipos_v1 WHERE id = %s", c, params=(viaje_id,)
-            )
+            df = pd.read_sql_query("SELECT * FROM anticipos_v1 WHERE id = %s", c, params=(viaje_id,))
             c.close()
             return df.iloc[0] if not df.empty else None
         except:
@@ -391,30 +518,23 @@ def main():
                 placa = st.selectbox("Placa de la tractomula", PLACAS)
                 conductor = st.selectbox("Conductor", lista_conductores)
                 cliente = st.selectbox(
-                    "Cliente",
-                    lista_clientes,
+                    "Cliente", lista_clientes,
                     help="Si no aparece el cliente, agrégalo en la pestaña 🏢 Clientes"
                 )
 
             with col2:
                 manifiesto = st.text_input(
-                    "Número de manifiesto ✱",
-                    placeholder="Ej: 1234567",
+                    "Número de manifiesto ✱", placeholder="Ej: 1234567",
                     help="Campo obligatorio"
                 )
                 origen = st.text_input("Origen", placeholder="Ciudad de origen")
                 destino = st.text_input("Destino", placeholder="Ciudad de destino")
-                anticipo_txt = st.text_input(
-                    "Valor del anticipo (COP)",
-                    placeholder="Ejemplo: 1.500.000"
-                )
+                anticipo_txt = st.text_input("Valor del anticipo (COP)", placeholder="Ejemplo: 1.500.000")
                 anticipo = limpiar(anticipo_txt)
                 if anticipo > 0:
                     st.caption(f"💵 {fmt(anticipo)} COP")
                 observaciones = st.text_area(
-                    "Observaciones",
-                    placeholder="Notas adicionales del viaje...",
-                    height=80
+                    "Observaciones", placeholder="Notas adicionales del viaje...", height=80
                 )
 
             submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
@@ -460,7 +580,6 @@ def main():
     # ==================== TAB 2: LEGALIZAR ====================
     with tab_leg:
         st.header("Legalizar anticipos pendientes")
-        st.info("Solo los viajes en estado **Pendiente** aparecen aquí para legalizar.")
 
         col_f1, col_f2, col_f3, col_f4 = st.columns(4)
         with col_f1:
@@ -486,19 +605,76 @@ def main():
         if df_pendientes.empty:
             st.success("✅ No hay anticipos pendientes de legalización.")
         else:
-            st.warning(f"🔴 {len(df_pendientes)} viaje(s) pendiente(s) de legalización")
-
+            # ---- Clasificar por urgencia ----
+            criticos, atencion, al_dia = [], [], []
             for _, row in df_pendientes.iterrows():
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                entry = (row['id'], dias)
+                if nivel == "critical":
+                    criticos.append(entry)
+                elif nivel == "warning":
+                    atencion.append(entry)
+                else:
+                    al_dia.append(entry)
+
+            total_pendiente = df_pendientes['valor_anticipo'].sum()
+
+            # ---- Banner de resumen ----
+            if criticos:
+                st.error(
+                    f"🚨 **{len(criticos)} anticipo(s) CRÍTICO(S)** con más de 7 días sin legalizar  |  "
+                    f"🟡 {len(atencion)} en atención (4-7 días)  |  "
+                    f"🟢 {len(al_dia)} al día  |  "
+                    f"💰 Total pendiente: **${fmt(total_pendiente)} COP**"
+                )
+            elif atencion:
+                st.warning(
+                    f"🟡 **{len(atencion)} anticipo(s)** requieren atención (4-7 días)  |  "
+                    f"🟢 {len(al_dia)} al día  |  "
+                    f"💰 Total pendiente: **${fmt(total_pendiente)} COP**"
+                )
+            else:
+                st.info(
+                    f"🟢 {len(al_dia)} viaje(s) pendiente(s), todos al día  |  "
+                    f"💰 Total pendiente: **${fmt(total_pendiente)} COP**"
+                )
+
+            # ---- Expanders por viaje ----
+            # Ordenar: críticos primero, luego atención, luego ok
+            def sort_key(row):
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                orden = {"critical": 0, "warning": 1, "ok": 2}
+                return (orden[nivel], -dias)
+
+            df_ordenado = df_pendientes.copy()
+            df_ordenado["_sort"] = df_ordenado.apply(
+                lambda r: sort_key(r), axis=1
+            )
+            df_ordenado = df_ordenado.sort_values("_sort")
+
+            for _, row in df_ordenado.iterrows():
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                badge = badge_alerta(dias, nivel)
+
                 manif_label = f"Manif: {row.get('manifiesto','—')} | " if row.get('manifiesto') else ""
-                with st.expander(
-                    f"ID {row['id']} | {manif_label}{row['fecha_viaje']} | "
-                    f"{row['placa']} | {row['conductor']} | "
+                label_expander = (
+                    f"{badge} | ID {row['id']} | {manif_label}"
+                    f"{row['fecha_viaje']} | {row['placa']} | {row['conductor']} | "
                     f"{row['origen']} → {row['destino']} | ${fmt(row['valor_anticipo'])} COP"
-                ):
+                )
+
+                with st.expander(label_expander):
                     col_info, col_form = st.columns([2, 2])
 
                     with col_info:
                         st.markdown("**Datos del viaje:**")
+                        if nivel == "critical":
+                            st.error(f"⏰ Este anticipo lleva **{dias} días** sin legalizar — acción urgente")
+                        elif nivel == "warning":
+                            st.warning(f"⚠️ Este anticipo lleva **{dias} días** sin legalizar")
+                        else:
+                            st.success(f"✅ {dias} días desde el viaje — al día")
+
                         st.write(f"📄 Manifiesto: **{row.get('manifiesto', '—')}**")
                         st.write(f"📅 Fecha: {row['fecha_viaje']}")
                         st.write(f"🚛 Placa: {row['placa']}")
@@ -531,9 +707,7 @@ def main():
                                 st.error("⚠️ Debes escribir tu nombre para poder legalizar.")
                             else:
                                 ok = db.legalizar(
-                                    row['id'],
-                                    nombre_leg.strip().upper(),
-                                    obs_leg.strip()
+                                    row['id'], nombre_leg.strip().upper(), obs_leg.strip()
                                 )
                                 if ok:
                                     st.success(
@@ -549,9 +723,7 @@ def main():
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            estado_filtro = st.selectbox(
-                "Estado", ["Todos", "Pendientes", "Legalizados"], key="hist_estado"
-            )
+            estado_filtro = st.selectbox("Estado", ["Todos", "Pendientes", "Legalizados"], key="hist_estado")
         with col2:
             fecha_ini_h = st.date_input("Desde", value=None, key="hist_fi")
         with col3:
@@ -561,13 +733,9 @@ def main():
         with col4:
             placa_h = st.selectbox("Placa", ["Todas"] + PLACAS, key="hist_placa")
         with col5:
-            conductor_h = st.text_input(
-                "Buscar conductor", placeholder="Nombre parcial...", key="hist_cond"
-            )
+            conductor_h = st.text_input("Buscar conductor", placeholder="Nombre parcial...", key="hist_cond")
         with col6:
-            manifiesto_h = st.text_input(
-                "Buscar por manifiesto", placeholder="Nº manifiesto...", key="hist_manif"
-            )
+            manifiesto_h = st.text_input("Buscar por manifiesto", placeholder="Nº manifiesto...", key="hist_manif")
 
         estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
         fi_h   = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
@@ -590,11 +758,22 @@ def main():
             pendientes     = len(df_hist) - legalizados
 
             col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-            col_m1.metric("Total viajes", len(df_hist))
-            col_m2.metric("Legalizados", legalizados)
-            col_m3.metric("Pendientes", pendientes)
+            col_m1.metric("Total viajes",    len(df_hist))
+            col_m2.metric("Legalizados",     legalizados)
+            col_m3.metric("Pendientes",      pendientes)
             col_m4.metric("Total anticipos", f"${fmt(total_anticipo)}")
 
+            # ---- Alerta de críticos en historial ----
+            if estado_filtro in ["Todos", "Pendientes"]:
+                df_pend_hist = df_hist[df_hist['legalizado'] == False]
+                criticos_hist = sum(
+                    1 for _, r in df_pend_hist.iterrows()
+                    if clasificar_alerta(r['fecha_viaje'])[1] == "critical"
+                )
+                if criticos_hist > 0:
+                    st.error(f"🚨 Hay **{criticos_hist} anticipo(s) crítico(s)** con más de 7 días sin legalizar en esta vista.")
+
+            # ---- Tabla ----
             cols_tabla = [
                 'id', 'manifiesto', 'fecha_viaje', 'placa', 'conductor', 'cliente',
                 'origen', 'destino', 'valor_anticipo', 'legalizado',
@@ -602,19 +781,50 @@ def main():
             ]
             cols_ok = [c for c in cols_tabla if c in df_hist.columns]
             df_show = df_hist[cols_ok].copy()
+
+            # Agregar columna de días pendientes
+            def dias_pendiente(row):
+                if row.get('legalizado'):
+                    return "—"
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                return f"{badge_alerta(dias, nivel)}"
+
+            df_show['dias_alerta'] = df_hist.apply(dias_pendiente, axis=1)
             df_show['valor_anticipo'] = df_show['valor_anticipo'].apply(lambda x: f"${fmt(x)}")
             df_show['legalizado'] = df_show['legalizado'].apply(
                 lambda x: "✅ Legalizado" if x else "🔴 Pendiente"
             )
+
             rename_map = {
                 'id': 'ID', 'manifiesto': 'Manifiesto', 'fecha_viaje': 'Fecha viaje',
                 'placa': 'Placa', 'conductor': 'Conductor', 'cliente': 'Cliente',
                 'origen': 'Origen', 'destino': 'Destino', 'valor_anticipo': 'Anticipo',
                 'legalizado': 'Estado', 'legalizado_por': 'Legalizado por',
-                'fecha_legalizacion': 'Fecha legalización'
+                'fecha_legalizacion': 'Fecha legalización', 'dias_alerta': 'Alerta'
             }
             df_show.rename(columns=rename_map, inplace=True)
             st.dataframe(df_show, use_container_width=True, hide_index=True, height=350)
+
+            # ---- Botón exportar Excel ----
+            st.divider()
+            col_exp1, col_exp2 = st.columns([3, 1])
+            with col_exp1:
+                titulo_excel = st.text_input(
+                    "Título del reporte Excel",
+                    value=f"Anticipos {estado_filtro} — {hora_colombia().strftime('%d/%m/%Y')}",
+                    key="titulo_excel"
+                )
+            with col_exp2:
+                st.markdown("&nbsp;")
+                excel_bytes = generar_excel(df_hist, titulo_excel)
+                nombre_archivo = f"anticipos_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx"
+                st.download_button(
+                    label="📥 Exportar a Excel",
+                    data=excel_bytes,
+                    file_name=nombre_archivo,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
 
             st.divider()
             st.subheader("Acciones sobre un viaje")
@@ -637,6 +847,14 @@ def main():
             with col_det:
                 estado_tag = "✅ **LEGALIZADO**" if row_sel['legalizado'] else "🔴 **PENDIENTE**"
                 st.markdown(f"**Estado:** {estado_tag}")
+
+                if not row_sel['legalizado']:
+                    dias_sel, nivel_sel = clasificar_alerta(row_sel['fecha_viaje'])
+                    if nivel_sel == "critical":
+                        st.error(f"⏰ Este anticipo lleva **{dias_sel} días** sin legalizar")
+                    elif nivel_sel == "warning":
+                        st.warning(f"⚠️ Este anticipo lleva **{dias_sel} días** sin legalizar")
+
                 st.write(f"📄 Manifiesto: **{row_sel.get('manifiesto', '—')}**")
                 st.write(f"Fecha viaje: {row_sel['fecha_viaje']}")
                 st.write(f"Placa: {row_sel['placa']} | Conductor: {row_sel['conductor']}")
@@ -686,10 +904,7 @@ def main():
 
             if viaje_edit is not None:
                 st.divider()
-                st.subheader(
-                    f"✏️ Editando viaje ID {eid} | "
-                    f"Manifiesto: {viaje_edit.get('manifiesto','—')}"
-                )
+                st.subheader(f"✏️ Editando viaje ID {eid} | Manifiesto: {viaje_edit.get('manifiesto','—')}")
 
                 lista_clientes_edit = get_lista_clientes(db)
                 cliente_actual = viaje_edit['cliente']
@@ -713,19 +928,9 @@ def main():
                             "Fecha del viaje",
                             value=pd.to_datetime(viaje_edit['fecha_viaje']).date()
                         )
-                        placa_e = st.selectbox(
-                            "Placa de la tractomula",
-                            PLACAS,
-                            index=idx_placa_edit
-                        )
-                        conductor_e = st.selectbox(
-                            "Conductor",
-                            lista_conductores_edit,
-                            index=idx_conductor_edit
-                        )
-                        cliente_e = st.selectbox(
-                            "Cliente", lista_clientes_edit, index=idx_cliente
-                        )
+                        placa_e = st.selectbox("Placa de la tractomula", PLACAS, index=idx_placa_edit)
+                        conductor_e = st.selectbox("Conductor", lista_conductores_edit, index=idx_conductor_edit)
+                        cliente_e = st.selectbox("Cliente", lista_clientes_edit, index=idx_cliente)
                         manifiesto_e = st.text_input(
                             "Número de manifiesto ✱",
                             value=viaje_edit.get('manifiesto', '') or '',
@@ -733,19 +938,16 @@ def main():
                         )
 
                     with col2:
-                        origen_e = st.text_input("Origen", value=viaje_edit['origen'])
+                        origen_e  = st.text_input("Origen",  value=viaje_edit['origen'])
                         destino_e = st.text_input("Destino", value=viaje_edit['destino'])
                         anticipo_e_txt = st.text_input(
-                            "Valor del anticipo (COP)",
-                            value=fmt(viaje_edit['valor_anticipo'])
+                            "Valor del anticipo (COP)", value=fmt(viaje_edit['valor_anticipo'])
                         )
                         anticipo_e = limpiar(anticipo_e_txt)
                         if anticipo_e > 0:
                             st.caption(f"💵 {fmt(anticipo_e)} COP")
                         obs_e = st.text_area(
-                            "Observaciones",
-                            value=viaje_edit.get('observaciones', '') or '',
-                            height=80
+                            "Observaciones", value=viaje_edit.get('observaciones', '') or '', height=80
                         )
 
                     col_g, col_c = st.columns(2)
@@ -756,22 +958,17 @@ def main():
 
                     if guardar_edit:
                         errores_e = []
-                        if not manifiesto_e.strip():
-                            errores_e.append("El número de manifiesto es obligatorio")
-                        if not origen_e.strip():
-                            errores_e.append("Origen es obligatorio")
-                        if not destino_e.strip():
-                            errores_e.append("Destino es obligatorio")
-                        if anticipo_e <= 0:
-                            errores_e.append("El valor del anticipo debe ser mayor a 0")
+                        if not manifiesto_e.strip(): errores_e.append("El número de manifiesto es obligatorio")
+                        if not origen_e.strip():     errores_e.append("Origen es obligatorio")
+                        if not destino_e.strip():    errores_e.append("Destino es obligatorio")
+                        if anticipo_e <= 0:          errores_e.append("El valor del anticipo debe ser mayor a 0")
 
                         if errores_e:
                             for err in errores_e:
                                 st.error(f"⚠️ {err}")
                         else:
                             ok = db.editar_viaje(eid, {
-                                'fecha_viaje': fecha_e,
-                                'placa': placa_e,
+                                'fecha_viaje': fecha_e, 'placa': placa_e,
                                 'conductor': conductor_e.strip().upper(),
                                 'cliente': cliente_e.strip().upper(),
                                 'origen': origen_e.strip().upper(),
@@ -792,10 +989,7 @@ def main():
     # ==================== TAB 4: CLIENTES ====================
     with tab_clientes:
         st.header("🏢 Gestión de Clientes")
-        st.markdown(
-            "Agrega aquí los clientes adicionales. "
-            "Los clientes predeterminados siempre estarán disponibles."
-        )
+        st.markdown("Agrega aquí los clientes adicionales. Los clientes predeterminados siempre estarán disponibles.")
 
         st.subheader("Clientes predeterminados")
         cols = st.columns(len(CLIENTES_DEFAULT))
@@ -804,13 +998,9 @@ def main():
                 st.info(c_def)
 
         st.divider()
-
         st.subheader("Agregar cliente nuevo")
         with st.form("form_nuevo_cliente", clear_on_submit=True):
-            nuevo_cliente = st.text_input(
-                "Nombre del cliente",
-                placeholder="Ej: LOGÍSTICA DEL NORTE"
-            )
+            nuevo_cliente = st.text_input("Nombre del cliente", placeholder="Ej: LOGÍSTICA DEL NORTE")
             agregar_btn = st.form_submit_button("➕ Agregar Cliente", type="primary")
 
             if agregar_btn:
@@ -827,7 +1017,6 @@ def main():
                         st.error("❌ Ese cliente ya existe o hubo un error al guardarlo.")
 
         st.divider()
-
         st.subheader("Clientes adicionales registrados")
         df_extras = db.obtener_clientes_extra()
 
@@ -873,7 +1062,6 @@ def main():
             "Los conductores predeterminados siempre estarán disponibles y no se pueden eliminar."
         )
 
-        # --- Conductores predeterminados ---
         st.subheader("Conductores predeterminados")
         cols_def = st.columns(4)
         for i, c_def in enumerate(sorted(CONDUCTORES_DEFAULT)):
@@ -881,14 +1069,9 @@ def main():
                 st.info(c_def)
 
         st.divider()
-
-        # --- Agregar conductor nuevo ---
         st.subheader("Agregar conductor nuevo")
         with st.form("form_nuevo_conductor", clear_on_submit=True):
-            nuevo_conductor = st.text_input(
-                "Nombre del conductor",
-                placeholder="Ej: JUAN PABLO GOMEZ"
-            )
+            nuevo_conductor = st.text_input("Nombre del conductor", placeholder="Ej: JUAN PABLO GOMEZ")
             agregar_cond_btn = st.form_submit_button("➕ Agregar Conductor", type="primary")
 
             if agregar_cond_btn:
@@ -905,8 +1088,6 @@ def main():
                         st.error("❌ Ese conductor ya existe o hubo un error al guardarlo.")
 
         st.divider()
-
-        # --- Conductores adicionales registrados ---
         st.subheader("Conductores adicionales registrados")
         df_conductores = db.obtener_conductores_extra()
 
@@ -917,13 +1098,10 @@ def main():
                 col_nombre, col_fecha, col_edit, col_del = st.columns([3, 2, 1, 1])
 
                 with col_nombre:
-                    # Si estamos editando este conductor, mostrar campo de texto
                     if st.session_state.editando_conductor_id == row['id']:
                         nombre_editado = st.text_input(
-                            "Nuevo nombre",
-                            value=row['nombre'],
-                            key=f"edit_input_{row['id']}",
-                            label_visibility="collapsed"
+                            "Nuevo nombre", value=row['nombre'],
+                            key=f"edit_input_{row['id']}", label_visibility="collapsed"
                         )
                     else:
                         st.write(f"**{row['nombre']}**")

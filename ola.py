@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v6: conductor como campo de texto libre (sin autocompletado por placa)
+v7: gestión dinámica de conductores (agregar / editar / eliminar)
 """
 
 import streamlit as st
@@ -40,8 +40,8 @@ PLACAS = [
     "UYY788", "PSX350"
 ]
 
-# Lista de conductores para el desplegable
-CONDUCTORES = [
+# Conductores predeterminados (no se pueden eliminar)
+CONDUCTORES_DEFAULT = [
     "CARLOS TAFUR",
     "CHRISTIAN MARTINEZ",
     "EDGAR DE JESUS",
@@ -109,11 +109,20 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
+            # NUEVA TABLA: conductores adicionales
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conductores_extra (
+                    id SERIAL PRIMARY KEY,
+                    nombre TEXT UNIQUE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
             c.commit()
             c.close()
         except Exception as e:
             st.error(f"Error inicializando tablas: {e}")
 
+    # -------- CLIENTES --------
     def obtener_clientes_extra(self):
         try:
             c = self.conn()
@@ -147,6 +156,56 @@ class DB:
         except Exception as e:
             st.error(f"Error eliminando cliente: {e}")
 
+    # -------- CONDUCTORES --------
+    def obtener_conductores_extra(self):
+        try:
+            c = self.conn()
+            df = pd.read_sql_query("SELECT * FROM conductores_extra ORDER BY nombre", c)
+            c.close()
+            return df
+        except:
+            return pd.DataFrame(columns=['id', 'nombre', 'fecha_registro'])
+
+    def agregar_conductor(self, nombre):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
+                (nombre.strip().upper(), hora_colombia())
+            )
+            c.commit()
+            c.close()
+            return True
+        except:
+            return False
+
+    def editar_conductor(self, conductor_id, nombre_nuevo):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute(
+                "UPDATE conductores_extra SET nombre = %s WHERE id = %s",
+                (nombre_nuevo.strip().upper(), conductor_id)
+            )
+            c.commit()
+            c.close()
+            return True
+        except Exception as e:
+            st.error(f"Error editando conductor: {e}")
+            return False
+
+    def eliminar_conductor(self, conductor_id):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("DELETE FROM conductores_extra WHERE id = %s", (conductor_id,))
+            c.commit()
+            c.close()
+        except Exception as e:
+            st.error(f"Error eliminando conductor: {e}")
+
+    # -------- VIAJES --------
     def registrar_viaje(self, data):
         try:
             c = self.conn()
@@ -272,12 +331,16 @@ class DB:
             return None
 
 
-# ==================== HELPER ====================
+# ==================== HELPERS ====================
 def get_lista_clientes(db):
     extras_df = db.obtener_clientes_extra()
     extras = extras_df['nombre'].tolist() if not extras_df.empty else []
-    todos = sorted(set(CLIENTES_DEFAULT + extras))
-    return todos
+    return sorted(set(CLIENTES_DEFAULT + extras))
+
+def get_lista_conductores(db):
+    extras_df = db.obtener_conductores_extra()
+    extras = extras_df['nombre'].tolist() if not extras_df.empty else []
+    return sorted(set(CONDUCTORES_DEFAULT + extras))
 
 
 # ==================== APP PRINCIPAL ====================
@@ -298,14 +361,19 @@ def main():
         st.session_state.editando_id = None
     if 'confirmar_eliminar_cliente' not in st.session_state:
         st.session_state.confirmar_eliminar_cliente = None
+    if 'confirmar_eliminar_conductor' not in st.session_state:
+        st.session_state.confirmar_eliminar_conductor = None
+    if 'editando_conductor_id' not in st.session_state:
+        st.session_state.editando_conductor_id = None
 
     db = st.session_state.db
 
-    tab_reg, tab_leg, tab_hist, tab_clientes = st.tabs([
+    tab_reg, tab_leg, tab_hist, tab_clientes, tab_conductores = st.tabs([
         "📝 Registrar Viaje",
         "✅ Legalizar Anticipos",
         "📋 Historial",
-        "🏢 Clientes"
+        "🏢 Clientes",
+        "👤 Conductores",
     ])
 
     # ==================== TAB 1: REGISTRAR ====================
@@ -313,6 +381,7 @@ def main():
         st.header("Registrar nuevo viaje con anticipo")
 
         lista_clientes = get_lista_clientes(db)
+        lista_conductores = get_lista_conductores(db)
 
         with st.form("form_registro", clear_on_submit=True):
             col1, col2 = st.columns(2)
@@ -320,7 +389,7 @@ def main():
             with col1:
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
                 placa = st.selectbox("Placa de la tractomula", PLACAS)
-                conductor = st.selectbox("Conductor", CONDUCTORES)
+                conductor = st.selectbox("Conductor", lista_conductores)
                 cliente = st.selectbox(
                     "Cliente",
                     lista_clientes,
@@ -628,14 +697,13 @@ def main():
                     lista_clientes_edit = [cliente_actual] + lista_clientes_edit
                 idx_cliente = lista_clientes_edit.index(cliente_actual)
 
-                idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
-
-                # Conductor actual: buscar en la lista o usar el valor guardado
+                lista_conductores_edit = get_lista_conductores(db)
                 conductor_actual = viaje_edit['conductor']
-                if conductor_actual in CONDUCTORES:
-                    idx_conductor_edit = CONDUCTORES.index(conductor_actual)
-                else:
-                    idx_conductor_edit = 0
+                if conductor_actual not in lista_conductores_edit:
+                    lista_conductores_edit = [conductor_actual] + lista_conductores_edit
+                idx_conductor_edit = lista_conductores_edit.index(conductor_actual)
+
+                idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
 
                 with st.form(f"form_editar_{eid}"):
                     col1, col2 = st.columns(2)
@@ -652,7 +720,7 @@ def main():
                         )
                         conductor_e = st.selectbox(
                             "Conductor",
-                            CONDUCTORES,
+                            lista_conductores_edit,
                             index=idx_conductor_edit
                         )
                         cliente_e = st.selectbox(
@@ -796,6 +864,121 @@ def main():
         todos = get_lista_clientes(db)
         for c in todos:
             st.write(f"• {c}")
+
+    # ==================== TAB 5: CONDUCTORES ====================
+    with tab_conductores:
+        st.header("👤 Gestión de Conductores")
+        st.markdown(
+            "Agrega, edita o elimina conductores adicionales. "
+            "Los conductores predeterminados siempre estarán disponibles y no se pueden eliminar."
+        )
+
+        # --- Conductores predeterminados ---
+        st.subheader("Conductores predeterminados")
+        cols_def = st.columns(4)
+        for i, c_def in enumerate(sorted(CONDUCTORES_DEFAULT)):
+            with cols_def[i % 4]:
+                st.info(c_def)
+
+        st.divider()
+
+        # --- Agregar conductor nuevo ---
+        st.subheader("Agregar conductor nuevo")
+        with st.form("form_nuevo_conductor", clear_on_submit=True):
+            nuevo_conductor = st.text_input(
+                "Nombre del conductor",
+                placeholder="Ej: JUAN PABLO GOMEZ"
+            )
+            agregar_cond_btn = st.form_submit_button("➕ Agregar Conductor", type="primary")
+
+            if agregar_cond_btn:
+                if not nuevo_conductor.strip():
+                    st.error("⚠️ El nombre del conductor no puede estar vacío.")
+                elif nuevo_conductor.strip().upper() in [c.upper() for c in CONDUCTORES_DEFAULT]:
+                    st.warning("⚠️ Ese conductor ya existe en la lista predeterminada.")
+                else:
+                    ok = db.agregar_conductor(nuevo_conductor.strip())
+                    if ok:
+                        st.success(f"✅ Conductor **{nuevo_conductor.strip().upper()}** agregado correctamente.")
+                        st.rerun()
+                    else:
+                        st.error("❌ Ese conductor ya existe o hubo un error al guardarlo.")
+
+        st.divider()
+
+        # --- Conductores adicionales registrados ---
+        st.subheader("Conductores adicionales registrados")
+        df_conductores = db.obtener_conductores_extra()
+
+        if df_conductores.empty:
+            st.info("No hay conductores adicionales registrados aún.")
+        else:
+            for _, row in df_conductores.iterrows():
+                col_nombre, col_fecha, col_edit, col_del = st.columns([3, 2, 1, 1])
+
+                with col_nombre:
+                    # Si estamos editando este conductor, mostrar campo de texto
+                    if st.session_state.editando_conductor_id == row['id']:
+                        nombre_editado = st.text_input(
+                            "Nuevo nombre",
+                            value=row['nombre'],
+                            key=f"edit_input_{row['id']}",
+                            label_visibility="collapsed"
+                        )
+                    else:
+                        st.write(f"**{row['nombre']}**")
+
+                with col_fecha:
+                    st.write(f"Registrado: {str(row['fecha_registro'])[:16]}")
+
+                with col_edit:
+                    if st.session_state.editando_conductor_id == row['id']:
+                        if st.button("💾", key=f"save_cond_{row['id']}", help="Guardar cambios"):
+                            if nombre_editado.strip():
+                                ok = db.editar_conductor(row['id'], nombre_editado.strip())
+                                if ok:
+                                    st.success(f"✅ Conductor actualizado a **{nombre_editado.strip().upper()}**")
+                                    st.session_state.editando_conductor_id = None
+                                    st.rerun()
+                            else:
+                                st.error("El nombre no puede estar vacío.")
+                    else:
+                        if st.button("✏️", key=f"edit_cond_{row['id']}", help="Editar nombre"):
+                            st.session_state.editando_conductor_id = row['id']
+                            st.session_state.confirmar_eliminar_conductor = None
+                            st.rerun()
+
+                with col_del:
+                    if st.session_state.editando_conductor_id == row['id']:
+                        if st.button("✖", key=f"cancel_cond_{row['id']}", help="Cancelar edición"):
+                            st.session_state.editando_conductor_id = None
+                            st.rerun()
+                    elif st.session_state.confirmar_eliminar_conductor == row['id']:
+                        st.warning("¿Eliminar?")
+                        c_si, c_no = st.columns(2)
+                        with c_si:
+                            if st.button("Sí", key=f"si_cond_{row['id']}"):
+                                db.eliminar_conductor(row['id'])
+                                st.session_state.confirmar_eliminar_conductor = None
+                                st.success("Conductor eliminado.")
+                                st.rerun()
+                        with c_no:
+                            if st.button("No", key=f"no_cond_{row['id']}"):
+                                st.session_state.confirmar_eliminar_conductor = None
+                                st.rerun()
+                    else:
+                        if st.button("🗑️", key=f"del_cond_{row['id']}", help="Eliminar conductor"):
+                            st.session_state.confirmar_eliminar_conductor = row['id']
+                            st.session_state.editando_conductor_id = None
+                            st.rerun()
+
+        st.divider()
+        st.subheader("Lista completa de conductores disponibles en el sistema")
+        todos_conductores = get_lista_conductores(db)
+        cols_todos = st.columns(3)
+        for i, c in enumerate(todos_conductores):
+            with cols_todos[i % 3]:
+                st.write(f"• {c}")
 
 
 if __name__ == "__main__":

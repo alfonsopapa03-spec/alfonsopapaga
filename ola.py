@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v8: alertas de vencimiento + exportar a Excel
+v9: alertas de vencimiento + exportar a Excel + orden por fecha viaje desc
 """
 
 import streamlit as st
@@ -432,7 +432,7 @@ class DB:
                 q += " AND conductor ILIKE %s"; params.append(f"%{conductor}%")
             if manifiesto:
                 q += " AND manifiesto ILIKE %s"; params.append(f"%{manifiesto}%")
-            q += " ORDER BY fecha_registro DESC"
+            q += " ORDER BY fecha_viaje DESC, fecha_registro DESC"
             df = pd.read_sql_query(q, c, params=params)
             c.close()
             return df
@@ -640,17 +640,8 @@ def main():
                 )
 
             # ---- Expanders por viaje ----
-            # Ordenar: críticos primero, luego atención, luego ok
-            def sort_key(row):
-                dias, nivel = clasificar_alerta(row['fecha_viaje'])
-                orden = {"critical": 0, "warning": 1, "ok": 2}
-                return (orden[nivel], -dias)
-
-            df_ordenado = df_pendientes.copy()
-            df_ordenado["_sort"] = df_ordenado.apply(
-                lambda r: sort_key(r), axis=1
-            )
-            df_ordenado = df_ordenado.sort_values("_sort")
+            # Ordenar por fecha de viaje más reciente primero
+            df_ordenado = df_pendientes.sort_values("fecha_viaje", ascending=False)
 
             for _, row in df_ordenado.iterrows():
                 dias, nivel = clasificar_alerta(row['fecha_viaje'])

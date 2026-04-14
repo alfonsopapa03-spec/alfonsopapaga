@@ -1,7 +1,7 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v10: + Vacaciones de conductores + Préstamos con trazabilidad
+v11: Vacaciones por períodos anuales (aniversario) con alertas de vencimiento
 """
 
 import streamlit as st
@@ -58,6 +58,96 @@ def badge_alerta(dias, nivel):
         return f"🟡 {dias}d"
     else:
         return f"🟢 {dias}d"
+
+# ==================== LÓGICA DE VACACIONES POR PERÍODOS ANUALES ====================
+
+def calcular_periodos_anuales(fecha_ingreso: date, hoy: date) -> list:
+    """
+    Genera la lista de todos los períodos anuales desde la fecha de ingreso hasta hoy.
+    Cada período corresponde a un año laboral: ingreso+N → ingreso+(N+1)
+    Retorna lista de dicts: {anio_laboral, inicio, fin, vencimiento}
+    - anio_laboral: número de año (1 = primer año, 2 = segundo, etc.)
+    - inicio: fecha inicio del período
+    - fin: fecha fin del período
+    - vencimiento: fecha en que se debe tomar la vacación (fin del período = aniversario)
+    """
+    periodos = []
+    n = 1
+    while True:
+        try:
+            inicio = fecha_ingreso.replace(year=fecha_ingreso.year + (n - 1))
+        except ValueError:
+            inicio = date(fecha_ingreso.year + (n - 1), fecha_ingreso.month, 28)
+        try:
+            fin = fecha_ingreso.replace(year=fecha_ingreso.year + n)
+        except ValueError:
+            fin = date(fecha_ingreso.year + n, fecha_ingreso.month, 28)
+
+        # Solo períodos ya cumplidos (el aniversario ya pasó)
+        if fin > hoy:
+            break
+        periodos.append({
+            "anio_laboral": n,
+            "inicio": inicio,
+            "fin": fin,
+            "label": f"Año {n} ({inicio.strftime('%d/%m/%Y')} → {fin.strftime('%d/%m/%Y')})"
+        })
+        n += 1
+    return periodos
+
+
+def calcular_estado_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.DataFrame, hoy: date) -> dict:
+    """
+    Para un conductor con su fecha de ingreso, determina:
+    - Períodos cumplidos (años laborales completos)
+    - Cuáles tienen vacaciones registradas
+    - Cuáles están vencidos (sin vacaciones)
+    - Cuántos días lleva vencido el período más antiguo sin tomar
+    """
+    periodos = calcular_periodos_anuales(fecha_ingreso, hoy)
+
+    # Vacaciones de este conductor
+    vac_cond = df_vac[df_vac["conductor"] == conductor] if not df_vac.empty else pd.DataFrame()
+
+    periodos_estado = []
+    for p in periodos:
+        # Buscar si existe alguna vacación registrada para este período anual
+        tomado = False
+        registros = []
+        if not vac_cond.empty and "anio_laboral" in vac_cond.columns:
+            matches = vac_cond[vac_cond["anio_laboral"] == p["anio_laboral"]]
+            if not matches.empty:
+                tomado = True
+                registros = matches.to_dict("records")
+        periodos_estado.append({**p, "tomado": tomado, "registros": registros})
+
+    periodos_vencidos = [p for p in periodos_estado if not p["tomado"]]
+    periodos_tomados  = [p for p in periodos_estado if p["tomado"]]
+
+    # Días desde que venció el período más antiguo sin tomar
+    dias_vencido_max = 0
+    if periodos_vencidos:
+        vencimiento_mas_antiguo = periodos_vencidos[0]["fin"]
+        dias_vencido_max = (hoy - vencimiento_mas_antiguo).days
+
+    # Próximo aniversario (siguiente período que aún no se cumple)
+    n_siguiente = len(periodos) + 1
+    try:
+        prox_aniv = fecha_ingreso.replace(year=fecha_ingreso.year + n_siguiente)
+    except ValueError:
+        prox_aniv = date(fecha_ingreso.year + n_siguiente, fecha_ingreso.month, 28)
+    dias_prox = (prox_aniv - hoy).days
+
+    return {
+        "periodos_cumplidos": len(periodos),
+        "periodos_tomados": len(periodos_tomados),
+        "periodos_vencidos": len(periodos_vencidos),
+        "periodos_estado": periodos_estado,
+        "dias_vencido_max": dias_vencido_max,
+        "prox_aniv": prox_aniv,
+        "dias_prox": dias_prox,
+    }
+
 
 # ==================== EXPORTAR EXCEL ANTICIPOS ====================
 def generar_excel(df: pd.DataFrame, titulo: str = "Anticipos") -> BytesIO:
@@ -149,8 +239,6 @@ def generar_excel(df: pd.DataFrame, titulo: str = "Anticipos") -> BytesIO:
 # ==================== EXPORTAR EXCEL PRÉSTAMOS ====================
 def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) -> BytesIO:
     wb = Workbook()
-
-    # Hoja 1: Resumen préstamos
     ws1 = wb.active
     ws1.title = "Préstamos"
     color_h    = "1F4E79"
@@ -200,7 +288,6 @@ def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) 
         ws1.column_dimensions[get_column_letter(ci)].width = aw
     ws1.freeze_panes = f"A{rh+1}"
 
-    # Hoja 2: Detalle pagos
     if not df_pagos.empty:
         ws2 = wb.create_sheet("Detalle pagos")
         ws2.merge_cells("A1:F1")
@@ -240,15 +327,15 @@ def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) 
     output = BytesIO(); wb.save(output); output.seek(0)
     return output
 
-# ==================== EXPORTAR EXCEL VACACIONES ====================
-def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, conductores: list) -> BytesIO:
+# ==================== EXPORTAR EXCEL VACACIONES (v11) ====================
+def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, conductores: list) -> BytesIO:
     wb = Workbook()
     ws = wb.active
     ws.title = "Vacaciones"
-    color_h   = "1F4E79"
+    color_h    = "1F4E79"
     color_venc = "FCE4EC"
-    color_prox = "FFF9C4"
     color_ok_  = "E8F5E9"
+    color_pend = "FFF9C4"
     fh = Font(name="Arial", bold=True, color="FFFFFF", size=10)
     fn = Font(name="Arial", size=9)
     ft = Font(name="Arial", bold=True, size=13, color="1F4E79")
@@ -256,44 +343,96 @@ def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, conduc
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
     left_a = Alignment(horizontal="left",   vertical="center")
-    ws.merge_cells("A1:G1")
-    ws["A1"] = f"Reporte de Vacaciones — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
+    ws.merge_cells("A1:H1")
+    ws["A1"] = f"Reporte de Vacaciones (por períodos anuales) — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
     ws["A1"].font = ft; ws["A1"].alignment = center
-    cols = ["Conductor","Fecha ingreso","Días acumulados","Días tomados","Días pendientes","Prox. vacación","Estado"]
+
+    cols = ["Conductor","Fecha ingreso","Períodos cumplidos","Períodos tomados",
+            "Períodos vencidos","Días vencidos (más antiguo)","Próx. aniversario","Estado"]
     rh = 3
     for ci, cn in enumerate(cols, 1):
         cell = ws.cell(row=rh, column=ci, value=cn)
         cell.font = fh
         cell.fill = PatternFill("solid", fgColor=color_h)
         cell.alignment = center; cell.border = border
+
     hoy = hora_colombia().date()
     for ri, cond in enumerate(sorted(conductores), start=rh+1):
         info_row = df_info[df_info["conductor"]==cond].iloc[0] if not df_info.empty and (df_info["conductor"]==cond).any() else None
-        dias_tom = int(df_vac[df_vac["conductor"]==cond]["dias"].sum()) if not df_vac.empty and (df_vac["conductor"]==cond).any() else 0
         if info_row is not None and info_row.get("fecha_ingreso") is not None:
             fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
-            anios = (hoy - fi).days / 365.25
-            dias_acum = int(anios * 15)
-            dias_pend = max(0, dias_acum - dias_tom)
-            prox_aniv = fi.replace(year=fi.year + int(anios) + 1)
-            estado = "Vencidas" if dias_pend > 15 else ("Próximas" if dias_pend > 0 else "Al día")
-            fill_color = color_venc if dias_pend > 15 else (color_prox if dias_pend > 0 else color_ok_)
+            est = calcular_estado_vacaciones(cond, fi, df_vac, hoy)
+            estado_txt = "Vencidas" if est["periodos_vencidos"] > 0 else "Al día"
+            fill_color = color_venc if est["periodos_vencidos"] > 0 else color_ok_
+            valores = [
+                cond, str(fi),
+                est["periodos_cumplidos"], est["periodos_tomados"],
+                est["periodos_vencidos"], est["dias_vencido_max"],
+                str(est["prox_aniv"]), estado_txt
+            ]
         else:
-            dias_acum = "—"; dias_pend = "—"; prox_aniv = "—"; estado = "Sin fecha ingreso"
             fill_color = "F3F3F3"
+            valores = [cond, "—", "—", "—", "—", "—", "—", "Sin fecha ingreso"]
+
         fill = PatternFill("solid", fgColor=fill_color)
-        fi_str = str(info_row["fecha_ingreso"])[:10] if info_row is not None and info_row.get("fecha_ingreso") is not None else "—"
-        valores = [cond, fi_str, dias_acum, dias_tom, dias_pend, str(prox_aniv)[:10], estado]
         for ci, val in enumerate(valores, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
             cell.fill = fill; cell.border = border; cell.font = fn
-            cell.alignment = center if ci in [3,4,5,7] else left_a
-    anchos = [28,14,16,14,16,16,18]
+            cell.alignment = center if ci in [3,4,5,6,8] else left_a
+
+    anchos = [28,14,18,16,16,22,18,18]
     for ci, aw in enumerate(anchos, 1):
         ws.column_dimensions[get_column_letter(ci)].width = aw
     ws.freeze_panes = f"A{rh+1}"
+
+    # Hoja 2: detalle por período
+    ws2 = wb.create_sheet("Detalle períodos")
+    ws2.merge_cells("A1:G1")
+    ws2["A1"] = "Detalle de vacaciones por período anual"
+    ws2["A1"].font = ft; ws2["A1"].alignment = center
+    cols2 = ["Conductor","Año laboral","Período","Fecha inicio vac.","Fecha fin vac.","Días","Observaciones"]
+    for ci, cn in enumerate(cols2, 1):
+        cell = ws2.cell(row=3, column=ci, value=cn)
+        cell.font = fh; cell.fill = PatternFill("solid", fgColor=color_h)
+        cell.alignment = center; cell.border = border
+
+    ri2 = 4
+    for cond in sorted(conductores):
+        info_row = df_info[df_info["conductor"]==cond].iloc[0] if not df_info.empty and (df_info["conductor"]==cond).any() else None
+        if info_row is None or info_row.get("fecha_ingreso") is None:
+            continue
+        fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
+        est = calcular_estado_vacaciones(cond, fi, df_vac, hoy)
+        for p in est["periodos_estado"]:
+            if p["tomado"] and p["registros"]:
+                for reg in p["registros"]:
+                    fill2 = PatternFill("solid", fgColor=color_ok_)
+                    vals2 = [cond, p["anio_laboral"], p["label"],
+                             str(reg.get("fecha_inicio",""))[:10],
+                             str(reg.get("fecha_fin",""))[:10],
+                             reg.get("dias",""), reg.get("observaciones","") or ""]
+                    for ci, val in enumerate(vals2, 1):
+                        cell = ws2.cell(row=ri2, column=ci, value=val)
+                        cell.fill = fill2; cell.border = border; cell.font = fn
+                        cell.alignment = center if ci in [2,6] else left_a
+                    ri2 += 1
+            else:
+                fill2 = PatternFill("solid", fgColor=color_venc)
+                vals2 = [cond, p["anio_laboral"], p["label"], "NO TOMADAS", "", "", "VENCIDA"]
+                for ci, val in enumerate(vals2, 1):
+                    cell = ws2.cell(row=ri2, column=ci, value=val)
+                    cell.fill = fill2; cell.border = border; cell.font = fn
+                    cell.alignment = center if ci in [2,6] else left_a
+                ri2 += 1
+
+    anchos2 = [28,12,36,16,14,8,28]
+    for ci, aw in enumerate(anchos2, 1):
+        ws2.column_dimensions[get_column_letter(ci)].width = aw
+    ws2.freeze_panes = "A4"
+
     output = BytesIO(); wb.save(output); output.seek(0)
     return output
+
 
 # ==================== PLACAS ====================
 PLACAS = [
@@ -326,7 +465,6 @@ class DB:
     def _init_tablas(self):
         try:
             c = self.conn(); cur = c.cursor()
-            # Tabla principal anticipos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS anticipos_v1 (
                     id SERIAL PRIMARY KEY,
@@ -346,7 +484,6 @@ class DB:
                 )
             """)
             cur.execute("ALTER TABLE anticipos_v1 ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''")
-            # Catálogos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS clientes_extra (
                     id SERIAL PRIMARY KEY,
@@ -361,7 +498,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # Información de conductores (fecha ingreso, etc.)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS conductores_info (
                     id SERIAL PRIMARY KEY,
@@ -371,7 +507,7 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # Vacaciones
+            # ---- VACACIONES v11: columna anio_laboral ----
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS vacaciones (
                     id SERIAL PRIMARY KEY,
@@ -379,12 +515,14 @@ class DB:
                     fecha_inicio DATE NOT NULL,
                     fecha_fin DATE NOT NULL,
                     dias INTEGER NOT NULL,
+                    anio_laboral INTEGER,
                     observaciones TEXT,
                     registrado_por TEXT,
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # Préstamos
+            # Migración: agregar columna si ya existía la tabla sin ella
+            cur.execute("ALTER TABLE vacaciones ADD COLUMN IF NOT EXISTS anio_laboral INTEGER")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS prestamos (
                     id SERIAL PRIMARY KEY,
@@ -397,7 +535,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # Pagos / descuentos de préstamos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS pagos_prestamos (
                     id SERIAL PRIMARY KEY,
@@ -524,11 +661,12 @@ class DB:
         try:
             c = self.conn(); cur = c.cursor()
             cur.execute("""
-                INSERT INTO vacaciones (conductor, fecha_inicio, fecha_fin, dias, observaciones, registrado_por, fecha_registro)
-                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+                INSERT INTO vacaciones (conductor, fecha_inicio, fecha_fin, dias, anio_laboral, observaciones, registrado_por, fecha_registro)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
             """, (
                 data['conductor'], data['fecha_inicio'], data['fecha_fin'],
-                int(data['dias']), data.get('observaciones',''),
+                int(data['dias']), data.get('anio_laboral'),
+                data.get('observaciones',''),
                 data.get('registrado_por','').strip().upper(), hora_colombia()
             ))
             nuevo_id = cur.fetchone()[0]
@@ -726,46 +864,7 @@ def get_lista_conductores(db):
     extras = extras_df['nombre'].tolist() if not extras_df.empty else []
     return sorted(set(CONDUCTORES_DEFAULT + extras))
 
-def calcular_vacaciones(conductor, df_info, df_vac):
-    """Retorna dict con días acumulados, tomados, pendientes, próxima vacación"""
-    hoy = hora_colombia().date()
-    info = df_info[df_info["conductor"] == conductor].iloc[0] if not df_info.empty and (df_info["conductor"] == conductor).any() else None
-    dias_tomados = int(df_vac[df_vac["conductor"] == conductor]["dias"].sum()) if not df_vac.empty and (df_vac["conductor"] == conductor).any() else 0
-
-    if info is not None and info.get("fecha_ingreso") is not None:
-        fi = pd.to_datetime(info["fecha_ingreso"]).date()
-        anios_trabajados = (hoy - fi).days / 365.25
-        dias_acum = int(anios_trabajados * 15)
-        dias_pend = max(0, dias_acum - dias_tomados)
-        # Próximo aniversario
-        anio_actual_aniv = fi.year + int(anios_trabajados)
-        try:
-            prox_aniv = fi.replace(year=anio_actual_aniv + 1)
-        except ValueError:
-            prox_aniv = date(anio_actual_aniv + 1, fi.month, 28)
-        dias_para_prox = (prox_aniv - hoy).days
-        return {
-            "fecha_ingreso": fi,
-            "anios": round(anios_trabajados, 1),
-            "dias_acum": dias_acum,
-            "dias_tomados": dias_tomados,
-            "dias_pend": dias_pend,
-            "prox_aniv": prox_aniv,
-            "dias_para_prox": dias_para_prox,
-        }
-    else:
-        return {
-            "fecha_ingreso": None,
-            "anios": None,
-            "dias_acum": None,
-            "dias_tomados": dias_tomados,
-            "dias_pend": None,
-            "prox_aniv": None,
-            "dias_para_prox": None,
-        }
-
 def calcular_saldo_prestamo(prestamo_id, monto_total, df_pagos):
-    """Retorna (pagado, saldo)"""
     if df_pagos.empty:
         return 0, int(monto_total)
     pagos_p = df_pagos[df_pagos["prestamo_id"] == prestamo_id]
@@ -779,7 +878,6 @@ def main():
     st.set_page_config(page_title="Anticipos - Transporte de Carga", layout="wide", page_icon="🚛")
     st.title("🚛 Gestión de Anticipos - Transporte de Carga")
 
-    # Session state
     for key, val in [
         ('db', None), ('confirmar_eliminar', None), ('editando_id', None),
         ('confirmar_eliminar_cliente', None), ('confirmar_eliminar_conductor', None),
@@ -817,8 +915,7 @@ def main():
                 fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
                 placa       = st.selectbox("Placa de la tractomula", PLACAS)
                 conductor   = st.selectbox("Conductor", lista_conductores)
-                cliente     = st.selectbox("Cliente", lista_clientes,
-                                           help="Si no aparece, agrégalo en 🏢 Clientes")
+                cliente     = st.selectbox("Cliente", lista_clientes)
             with col2:
                 manifiesto  = st.text_input("Número de manifiesto ✱", placeholder="Ej: 1234567")
                 origen      = st.text_input("Origen",  placeholder="Ciudad de origen")
@@ -850,15 +947,7 @@ def main():
                         'manifiesto': manifiesto.strip()
                     })
                     if nuevo_id:
-                        st.success(f"""
-✅ **Viaje registrado exitosamente (ID: {nuevo_id})**
-- Manifiesto: **{manifiesto.strip().upper()}**
-- Placa: {placa} | Conductor: {conductor.upper()}
-- Ruta: {origen.upper()} → {destino.upper()}
-- Cliente: {cliente.upper()}
-- Anticipo: **${fmt(anticipo)} COP**
-- Estado: 🔴 Pendiente de legalización
-                        """)
+                        st.success(f"✅ Viaje registrado exitosamente (ID: {nuevo_id})")
 
     # ==================== TAB 2: LEGALIZAR ====================
     with tab_leg:
@@ -887,11 +976,11 @@ def main():
                 else: al_dia.append(entry)
             total_pendiente = df_pendientes['valor_anticipo'].sum()
             if criticos:
-                st.error(f"🚨 **{len(criticos)} anticipo(s) CRÍTICO(S)** con más de 7 días sin legalizar  |  🟡 {len(atencion)} en atención  |  🟢 {len(al_dia)} al día  |  💰 Total: **${fmt(total_pendiente)} COP**")
+                st.error(f"🚨 **{len(criticos)} anticipo(s) CRÍTICO(S)** | 🟡 {len(atencion)} en atención | 🟢 {len(al_dia)} al día | 💰 Total: **${fmt(total_pendiente)} COP**")
             elif atencion:
-                st.warning(f"🟡 **{len(atencion)} anticipo(s)** requieren atención (4-7 días)  |  🟢 {len(al_dia)} al día  |  💰 Total: **${fmt(total_pendiente)} COP**")
+                st.warning(f"🟡 **{len(atencion)} anticipo(s)** requieren atención | 🟢 {len(al_dia)} al día | 💰 Total: **${fmt(total_pendiente)} COP**")
             else:
-                st.info(f"🟢 {len(al_dia)} viaje(s) pendiente(s), todos al día  |  💰 Total: **${fmt(total_pendiente)} COP**")
+                st.info(f"🟢 {len(al_dia)} viaje(s) pendiente(s), todos al día | 💰 Total: **${fmt(total_pendiente)} COP**")
 
             df_ordenado = df_pendientes.sort_values("fecha_viaje", ascending=False)
             for _, row in df_ordenado.iterrows():
@@ -905,29 +994,24 @@ def main():
                     col_info, col_form = st.columns([2, 2])
                     with col_info:
                         st.markdown("**Datos del viaje:**")
-                        if nivel == "critical": st.error(f"⏰ Este anticipo lleva **{dias} días** sin legalizar — acción urgente")
+                        if nivel == "critical": st.error(f"⏰ Este anticipo lleva **{dias} días** sin legalizar")
                         elif nivel == "warning": st.warning(f"⚠️ Este anticipo lleva **{dias} días** sin legalizar")
                         else: st.success(f"✅ {dias} días desde el viaje — al día")
                         st.write(f"📄 Manifiesto: **{row.get('manifiesto', '—')}**")
-                        st.write(f"📅 Fecha: {row['fecha_viaje']}")
-                        st.write(f"🚛 Placa: {row['placa']}")
-                        st.write(f"👤 Conductor: {row['conductor']}")
-                        st.write(f"🏢 Cliente: {row['cliente']}")
-                        st.write(f"📍 Ruta: {row['origen']} → {row['destino']}")
-                        st.write(f"💰 Anticipo: **${fmt(row['valor_anticipo'])} COP**")
-                        if row.get('observaciones'): st.write(f"📝 Obs: {row['observaciones']}")
+                        st.write(f"📅 Fecha: {row['fecha_viaje']} | 🚛 {row['placa']} | 👤 {row['conductor']}")
+                        st.write(f"🏢 {row['cliente']} | 📍 {row['origen']} → {row['destino']}")
+                        st.write(f"💰 **${fmt(row['valor_anticipo'])} COP**")
                     with col_form:
                         st.markdown("**Legalizar este viaje:**")
-                        nombre_leg = st.text_input("Tu nombre completo (obligatorio)", placeholder="Escribe tu nombre...", key=f"nombre_leg_{row['id']}")
-                        obs_leg = st.text_area("Observaciones (opcional)", height=80, key=f"obs_leg_{row['id']}")
+                        nombre_leg = st.text_input("Tu nombre completo", key=f"nombre_leg_{row['id']}")
+                        obs_leg = st.text_area("Observaciones", height=80, key=f"obs_leg_{row['id']}")
                         if st.button("✅ Marcar como LEGALIZADO", key=f"btn_leg_{row['id']}", type="primary"):
                             if not nombre_leg.strip():
-                                st.error("⚠️ Debes escribir tu nombre para poder legalizar.")
+                                st.error("⚠️ Debes escribir tu nombre.")
                             else:
                                 ok = db.legalizar(row['id'], nombre_leg.strip().upper(), obs_leg.strip())
                                 if ok:
-                                    st.success(f"✅ Viaje ID {row['id']} legalizado por **{nombre_leg.upper()}** a las {hora_colombia().strftime('%H:%M')}")
-                                    st.rerun()
+                                    st.success(f"✅ Viaje ID {row['id']} legalizado."); st.rerun()
 
     # ==================== TAB 3: HISTORIAL ====================
     with tab_hist:
@@ -938,8 +1022,8 @@ def main():
         with col3: fecha_fin_h  = st.date_input("Hasta", value=None, key="hist_ff")
         col4, col5, col6 = st.columns(3)
         with col4: placa_h      = st.selectbox("Placa", ["Todas"] + PLACAS, key="hist_placa")
-        with col5: conductor_h  = st.text_input("Buscar conductor", placeholder="Nombre parcial...", key="hist_cond")
-        with col6: manifiesto_h = st.text_input("Buscar por manifiesto", placeholder="Nº manifiesto...", key="hist_manif")
+        with col5: conductor_h  = st.text_input("Buscar conductor", key="hist_cond")
+        with col6: manifiesto_h = st.text_input("Buscar por manifiesto", key="hist_manif")
 
         estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
         fi_h  = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
@@ -959,12 +1043,6 @@ def main():
             col_m2.metric("Legalizados",     legalizados)
             col_m3.metric("Pendientes",      pendientes)
             col_m4.metric("Total anticipos", f"${fmt(total_anticipo)}")
-
-            if estado_filtro in ["Todos","Pendientes"]:
-                criticos_hist = sum(1 for _, r in df_hist[df_hist['legalizado']==False].iterrows()
-                                    if clasificar_alerta(r['fecha_viaje'])[1] == "critical")
-                if criticos_hist > 0:
-                    st.error(f"🚨 Hay **{criticos_hist} anticipo(s) crítico(s)** con más de 7 días sin legalizar.")
 
             cols_tabla = ['id','manifiesto','fecha_viaje','placa','conductor','cliente','origen',
                           'destino','valor_anticipo','legalizado','legalizado_por','fecha_legalizacion']
@@ -1005,29 +1083,21 @@ def main():
             with col_det:
                 estado_tag = "✅ **LEGALIZADO**" if row_sel['legalizado'] else "🔴 **PENDIENTE**"
                 st.markdown(f"**Estado:** {estado_tag}")
-                if not row_sel['legalizado']:
-                    dias_sel, nivel_sel = clasificar_alerta(row_sel['fecha_viaje'])
-                    if nivel_sel == "critical": st.error(f"⏰ Este anticipo lleva **{dias_sel} días** sin legalizar")
-                    elif nivel_sel == "warning": st.warning(f"⚠️ {dias_sel} días sin legalizar")
                 st.write(f"📄 Manifiesto: **{row_sel.get('manifiesto', '—')}**")
                 st.write(f"Fecha: {row_sel['fecha_viaje']} | Placa: {row_sel['placa']} | Conductor: {row_sel['conductor']}")
-                st.write(f"Cliente: {row_sel['cliente']}")
-                st.write(f"Ruta: {row_sel['origen']} → {row_sel['destino']}")
-                st.write(f"Anticipo: **${fmt(row_sel['valor_anticipo'])} COP**")
+                st.write(f"Ruta: {row_sel['origen']} → {row_sel['destino']} | Anticipo: **${fmt(row_sel['valor_anticipo'])} COP**")
                 if row_sel['legalizado']:
                     st.success(f"Legalizado por: **{row_sel['legalizado_por']}** | Fecha: {row_sel['fecha_legalizacion']}")
             with col_acc:
-                st.markdown("&nbsp;")
                 if st.button("✏️ Editar viaje", key="btn_editar"):
                     st.session_state.editando_id = viaje_sel; st.rerun()
-                st.markdown("&nbsp;")
                 if st.session_state.confirmar_eliminar == viaje_sel:
-                    st.warning(f"¿Seguro que quieres eliminar ID **{viaje_sel}**?")
+                    st.warning(f"¿Eliminar ID **{viaje_sel}**?")
                     c_si, c_no = st.columns(2)
                     with c_si:
-                        if st.button("Sí, eliminar", key="btn_si_eliminar", type="primary"):
+                        if st.button("Sí", key="btn_si_eliminar", type="primary"):
                             db.eliminar(viaje_sel); st.session_state.confirmar_eliminar = None
-                            st.success(f"Viaje ID {viaje_sel} eliminado."); st.rerun()
+                            st.success("Eliminado."); st.rerun()
                     with c_no:
                         if st.button("Cancelar", key="btn_no_eliminar"):
                             st.session_state.confirmar_eliminar = None; st.rerun()
@@ -1040,7 +1110,7 @@ def main():
             viaje_edit = db.obtener_por_id(eid)
             if viaje_edit is not None:
                 st.divider()
-                st.subheader(f"✏️ Editando viaje ID {eid} | Manifiesto: {viaje_edit.get('manifiesto','—')}")
+                st.subheader(f"✏️ Editando viaje ID {eid}")
                 lista_clientes_edit = get_lista_clientes(db)
                 cliente_actual = viaje_edit['cliente']
                 if cliente_actual not in lista_clientes_edit: lista_clientes_edit = [cliente_actual] + lista_clientes_edit
@@ -1064,7 +1134,6 @@ def main():
                         destino_e = st.text_input("Destino", value=viaje_edit['destino'])
                         anticipo_e_txt = st.text_input("Valor del anticipo (COP)", value=fmt(viaje_edit['valor_anticipo']))
                         anticipo_e = limpiar(anticipo_e_txt)
-                        if anticipo_e > 0: st.caption(f"💵 {fmt(anticipo_e)} COP")
                         obs_e = st.text_area("Observaciones", value=viaje_edit.get('observaciones','') or '', height=80)
                     col_g, col_c = st.columns(2)
                     with col_g: guardar_edit  = st.form_submit_button("💾 Guardar cambios", type="primary")
@@ -1093,116 +1162,179 @@ def main():
                     if cancelar_edit:
                         st.session_state.editando_id = None; st.rerun()
 
-    # ==================== TAB 4: VACACIONES ====================
+    # ==================== TAB 4: VACACIONES (v11) ====================
     with tab_vac:
         st.header("🏖️ Gestión de Vacaciones de Conductores")
-        st.markdown("En Colombia, cada trabajador acumula **15 días de vacaciones por año trabajado** (Art. 186 CST).")
+        st.markdown(
+            "**Lógica:** Cada conductor tiene derecho a vacaciones una vez cumplido cada año laboral "
+            "(a partir de su fecha de ingreso). Si el aniversario pasó y no hay registro de vacaciones "
+            "para ese período → **vacaciones vencidas**."
+        )
 
         lista_conductores_vac = get_lista_conductores(db)
         df_info_todos         = db.obtener_todos_info_conductores()
         df_vac_todos          = db.obtener_vacaciones()
+        hoy                   = hora_colombia().date()
 
-        # ---- Sub-tabs vacaciones ----
         v_tab1, v_tab2, v_tab3 = st.tabs(["📊 Resumen general", "📝 Registrar vacación", "⚙️ Fecha de ingreso"])
 
+        # ---- RESUMEN GENERAL ----
         with v_tab1:
             st.subheader("Estado de vacaciones por conductor")
 
-            # Filtro
-            col_f1v, col_f2v = st.columns([2, 2])
+            col_f1v, col_f2v = st.columns(2)
             with col_f1v:
                 filtro_cond_vac = st.selectbox("Filtrar por conductor", ["Todos"] + lista_conductores_vac, key="vac_filtro_cond")
             with col_f2v:
-                filtro_estado_vac = st.selectbox("Estado", ["Todos","Con vacaciones vencidas","Al día","Sin fecha ingreso"], key="vac_filtro_estado")
+                filtro_estado_vac = st.selectbox(
+                    "Filtrar por estado",
+                    ["Todos", "🔴 Con períodos vencidos", "✅ Al día", "⚪ Sin fecha ingreso"],
+                    key="vac_filtro_estado"
+                )
 
             conductores_mostrar = lista_conductores_vac if filtro_cond_vac == "Todos" else [filtro_cond_vac]
 
+            # Construir resumen
             resumen_rows = []
             for cond in conductores_mostrar:
-                calculo = calcular_vacaciones(cond, df_info_todos, df_vac_todos)
-                if calculo["dias_pend"] is None:
-                    estado_v = "Sin fecha ingreso"
-                elif calculo["dias_pend"] > 15:
-                    estado_v = "Vencidas"
-                elif calculo["dias_pend"] > 0:
-                    estado_v = "Pendientes"
+                info_row = df_info_todos[df_info_todos["conductor"] == cond].iloc[0] \
+                    if not df_info_todos.empty and (df_info_todos["conductor"] == cond).any() else None
+
+                if info_row is not None and info_row.get("fecha_ingreso") is not None:
+                    fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
+                    est = calcular_estado_vacaciones(cond, fi, df_vac_todos, hoy)
+                    if est["periodos_vencidos"] > 0:
+                        estado_v = "vencidas"
+                    elif est["periodos_cumplidos"] > 0:
+                        estado_v = "al_dia"
+                    else:
+                        estado_v = "sin_periodos"  # menos de 1 año
+                    resumen_rows.append({
+                        "conductor": cond,
+                        "fecha_ingreso": str(fi),
+                        "periodos_cumplidos": est["periodos_cumplidos"],
+                        "periodos_tomados": est["periodos_tomados"],
+                        "periodos_vencidos": est["periodos_vencidos"],
+                        "dias_vencido_max": est["dias_vencido_max"],
+                        "prox_aniv": str(est["prox_aniv"]),
+                        "dias_prox": est["dias_prox"],
+                        "estado_v": estado_v,
+                        "est_obj": est,
+                        "fi_date": fi,
+                    })
                 else:
-                    estado_v = "Al día"
-                resumen_rows.append({
-                    "conductor": cond,
-                    "fecha_ingreso": str(calculo["fecha_ingreso"]) if calculo["fecha_ingreso"] else "—",
-                    "anios": calculo["anios"],
-                    "dias_acum": calculo["dias_acum"],
-                    "dias_tomados": calculo["dias_tomados"],
-                    "dias_pend": calculo["dias_pend"],
-                    "prox_aniv": str(calculo["prox_aniv"]) if calculo["prox_aniv"] else "—",
-                    "dias_para_prox": calculo["dias_para_prox"],
-                    "estado_v": estado_v,
-                })
+                    resumen_rows.append({
+                        "conductor": cond,
+                        "fecha_ingreso": "—",
+                        "periodos_cumplidos": None,
+                        "periodos_vencidos": None,
+                        "periodos_tomados": None,
+                        "dias_vencido_max": None,
+                        "prox_aniv": "—",
+                        "dias_prox": None,
+                        "estado_v": "sin_fecha",
+                        "est_obj": None,
+                        "fi_date": None,
+                    })
 
             df_resumen = pd.DataFrame(resumen_rows)
 
-            if filtro_estado_vac == "Con vacaciones vencidas":
-                df_resumen = df_resumen[df_resumen["estado_v"] == "Vencidas"]
-            elif filtro_estado_vac == "Al día":
-                df_resumen = df_resumen[df_resumen["estado_v"].isin(["Al día"])]
-            elif filtro_estado_vac == "Sin fecha ingreso":
-                df_resumen = df_resumen[df_resumen["estado_v"] == "Sin fecha ingreso"]
+            # Aplicar filtro de estado
+            if filtro_estado_vac == "🔴 Con períodos vencidos":
+                df_resumen = df_resumen[df_resumen["estado_v"] == "vencidas"]
+            elif filtro_estado_vac == "✅ Al día":
+                df_resumen = df_resumen[df_resumen["estado_v"].isin(["al_dia", "sin_periodos"])]
+            elif filtro_estado_vac == "⚪ Sin fecha ingreso":
+                df_resumen = df_resumen[df_resumen["estado_v"] == "sin_fecha"]
 
             # Métricas rápidas
             col_mv1, col_mv2, col_mv3, col_mv4 = st.columns(4)
-            total_cond    = len(df_resumen)
-            con_vencidas  = (df_resumen["estado_v"] == "Vencidas").sum()
-            pendientes_v  = (df_resumen["estado_v"] == "Pendientes").sum()
-            sin_fecha_v   = (df_resumen["estado_v"] == "Sin fecha ingreso").sum()
-            col_mv1.metric("Total conductores", total_cond)
-            col_mv2.metric("🔴 Con vencidas",    con_vencidas)
-            col_mv3.metric("🟡 Pendientes",      pendientes_v)
-            col_mv4.metric("⚪ Sin fecha",        sin_fecha_v)
+            total_cond_v   = len(df_resumen)
+            con_vencidas   = (df_resumen["estado_v"] == "vencidas").sum()
+            al_dia_v       = df_resumen["estado_v"].isin(["al_dia", "sin_periodos"]).sum()
+            sin_fecha_v    = (df_resumen["estado_v"] == "sin_fecha").sum()
+            col_mv1.metric("Total conductores",   total_cond_v)
+            col_mv2.metric("🔴 Períodos vencidos", int(df_resumen["periodos_vencidos"].fillna(0).sum()))
+            col_mv3.metric("✅ Al día",            al_dia_v)
+            col_mv4.metric("⚪ Sin fecha ingreso", sin_fecha_v)
 
             if con_vencidas > 0:
-                st.error(f"🚨 **{con_vencidas} conductor(es)** tienen vacaciones vencidas (más de 15 días acumulados sin tomar).")
+                conductores_venc = df_resumen[df_resumen["estado_v"] == "vencidas"]["conductor"].tolist()
+                st.error(
+                    f"🚨 **{con_vencidas} conductor(es)** tienen vacaciones vencidas: "
+                    + ", ".join(conductores_venc)
+                )
 
             st.divider()
 
-            # Tabla expandible por conductor
+            # Tarjetas por conductor
             for _, r in df_resumen.iterrows():
                 cond = r["conductor"]
                 estado_v = r["estado_v"]
-                icono = "🔴" if estado_v == "Vencidas" else ("🟡" if estado_v == "Pendientes" else ("🟢" if estado_v == "Al día" else "⚪"))
-                label_v = (f"{icono} {cond}  |  Acumulados: {r['dias_acum'] if r['dias_acum'] is not None else '—'} días  |  "
-                           f"Tomados: {r['dias_tomados']} días  |  Pendientes: {r['dias_pend'] if r['dias_pend'] is not None else '—'} días  |  "
-                           f"Prox. aniversario: {r['prox_aniv']}")
+
+                if estado_v == "vencidas":
+                    icono = "🔴"
+                    n_venc = int(r["periodos_vencidos"])
+                    dias_v = int(r["dias_vencido_max"])
+                    label_v = (f"🔴 {cond}  |  {n_venc} período(s) VENCIDO(S)  |  "
+                               f"Hace {dias_v} días desde el último aniversario sin tomar  |  "
+                               f"Próx. aniversario: {r['prox_aniv']}")
+                elif estado_v == "al_dia":
+                    label_v = (f"✅ {cond}  |  {r['periodos_cumplidos']} período(s) cumplido(s), todos tomados  |  "
+                               f"Próx. aniversario: {r['prox_aniv']} (en {r['dias_prox']} días)")
+                elif estado_v == "sin_periodos":
+                    label_v = (f"🟢 {cond}  |  Menos de 1 año trabajado — aún no cumple el primer período  |  "
+                               f"Primer aniversario: {r['prox_aniv']} (en {r['dias_prox']} días)")
+                else:
+                    label_v = f"⚪ {cond}  |  Sin fecha de ingreso registrada"
 
                 with st.expander(label_v):
+                    if estado_v == "sin_fecha":
+                        st.warning("⚠️ Registra la fecha de ingreso en la pestaña **⚙️ Fecha de ingreso**.")
+                        continue
+
                     col_va, col_vb = st.columns([2, 2])
                     with col_va:
-                        st.markdown(f"**Estado: {estado_v}**")
-                        if r["fecha_ingreso"] != "—":
-                            st.write(f"📅 Fecha de ingreso: **{r['fecha_ingreso']}**")
-                            st.write(f"⏱️ Antigüedad: **{r['anios']} años**")
-                            st.write(f"📊 Días acumulados: **{r['dias_acum']}**")
-                            st.write(f"✅ Días tomados: **{r['dias_tomados']}**")
-                            pend_color = r['dias_pend']
-                            if pend_color is not None:
-                                if pend_color > 15: st.error(f"⚠️ Días pendientes/vencidos: **{pend_color}**")
-                                elif pend_color > 0: st.warning(f"📋 Días pendientes: **{pend_color}**")
-                                else: st.success("✅ Vacaciones al día")
-                            if r["dias_para_prox"] is not None:
-                                st.write(f"📆 Próx. aniversario: **{r['prox_aniv']}** (en {r['dias_para_prox']} días)")
-                        else:
-                            st.warning("⚠️ No se ha registrado la fecha de ingreso. Regístrala en la pestaña **⚙️ Fecha de ingreso**.")
+                        fi_d = r["fi_date"]
+                        st.write(f"📅 Fecha de ingreso: **{r['fecha_ingreso']}**")
+                        st.write(f"📆 Próximo aniversario: **{r['prox_aniv']}** (en {r['dias_prox']} días)")
+
+                        est_obj = r["est_obj"]
+                        if est_obj:
+                            st.markdown("**Períodos anuales:**")
+                            for p in est_obj["periodos_estado"]:
+                                if p["tomado"]:
+                                    reg = p["registros"][0] if p["registros"] else {}
+                                    st.success(
+                                        f"✅ **{p['label']}** — Tomadas: "
+                                        f"{str(reg.get('fecha_inicio',''))[:10]} → {str(reg.get('fecha_fin',''))[:10]} "
+                                        f"({reg.get('dias','?')} días)"
+                                    )
+                                else:
+                                    dias_desde = (hoy - p["fin"]).days
+                                    st.error(
+                                        f"🔴 **{p['label']}** — **NO TOMADAS** "
+                                        f"(vencidas hace **{dias_desde} días**)"
+                                    )
+
+                            if est_obj["periodos_cumplidos"] == 0:
+                                st.info(f"⏳ Aún no ha cumplido el primer año laboral. Primer aniversario: **{r['prox_aniv']}**")
 
                     with col_vb:
-                        st.markdown("**Historial de vacaciones tomadas:**")
-                        df_vac_cond = df_vac_todos[df_vac_todos["conductor"] == cond] if not df_vac_todos.empty else pd.DataFrame()
+                        st.markdown("**Historial de vacaciones registradas:**")
+                        df_vac_cond = df_vac_todos[df_vac_todos["conductor"] == cond] \
+                            if not df_vac_todos.empty else pd.DataFrame()
                         if df_vac_cond.empty:
-                            st.info("No hay vacaciones registradas para este conductor.")
+                            st.info("No hay vacaciones registradas.")
                         else:
                             for _, vrow in df_vac_cond.sort_values("fecha_inicio", ascending=False).iterrows():
-                                cols_vac = st.columns([3, 1])
+                                anio_lbl = f"Año {int(vrow['anio_laboral'])}" if pd.notna(vrow.get('anio_laboral')) else "Año ?"
+                                cols_vac = st.columns([4, 1])
                                 with cols_vac[0]:
-                                    st.write(f"📆 {vrow['fecha_inicio']} → {vrow['fecha_fin']} | **{vrow['dias']} días** | {vrow.get('observaciones','') or '—'}")
+                                    st.write(
+                                        f"📆 **{anio_lbl}** | {str(vrow['fecha_inicio'])[:10]} → {str(vrow['fecha_fin'])[:10]} "
+                                        f"| **{vrow['dias']} días** | {vrow.get('observaciones','') or '—'}"
+                                    )
                                 with cols_vac[1]:
                                     if st.session_state.confirmar_eliminar_vac == vrow['id']:
                                         st.warning("¿Eliminar?")
@@ -1211,66 +1343,122 @@ def main():
                                             if st.button("Sí", key=f"si_vac_{vrow['id']}"):
                                                 db.eliminar_vacacion(vrow['id'])
                                                 st.session_state.confirmar_eliminar_vac = None
-                                                st.success("Registro eliminado."); st.rerun()
+                                                st.rerun()
                                         with c_n:
                                             if st.button("No", key=f"no_vac_{vrow['id']}"):
                                                 st.session_state.confirmar_eliminar_vac = None; st.rerun()
                                     else:
-                                        if st.button("🗑️", key=f"del_vac_{vrow['id']}", help="Eliminar registro"):
+                                        if st.button("🗑️", key=f"del_vac_{vrow['id']}"):
                                             st.session_state.confirmar_eliminar_vac = vrow['id']; st.rerun()
 
             st.divider()
-            # Exportar Excel vacaciones
             col_exp_v1, col_exp_v2 = st.columns([3, 1])
             with col_exp_v2:
-                excel_vac = generar_excel_vacaciones(df_info_todos, df_vac_todos, lista_conductores_vac)
-                st.download_button(label="📥 Exportar vacaciones a Excel", data=excel_vac,
+                excel_vac = generar_excel_vacaciones_v11(df_info_todos, df_vac_todos, lista_conductores_vac)
+                st.download_button(
+                    label="📥 Exportar vacaciones a Excel", data=excel_vac,
                     file_name=f"vacaciones_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
 
+        # ---- REGISTRAR VACACIÓN ----
         with v_tab2:
             st.subheader("Registrar período de vacaciones tomado")
-            with st.form("form_vacacion", clear_on_submit=True):
-                col1v, col2v = st.columns(2)
-                with col1v:
-                    cond_vac  = st.selectbox("Conductor", lista_conductores_vac, key="vac_cond_reg")
-                    fi_vac    = st.date_input("Fecha inicio vacaciones", value=datetime.today())
-                    ff_vac    = st.date_input("Fecha fin vacaciones",    value=datetime.today())
-                with col2v:
-                    # Calcular días automáticamente
-                    dias_auto = max(1, (ff_vac - fi_vac).days + 1) if ff_vac >= fi_vac else 1
-                    st.metric("Días calculados", dias_auto)
-                    dias_vac  = st.number_input("Días de vacaciones (editable)", min_value=1, max_value=60, value=dias_auto)
-                    reg_por_v = st.text_input("Registrado por", placeholder="Tu nombre completo")
-                    obs_vac   = st.text_area("Observaciones", height=80)
+            st.markdown("Selecciona el conductor y el **año laboral** al que corresponden estas vacaciones.")
 
-                submitted_vac = st.form_submit_button("💾 Registrar Vacaciones", type="primary")
-                if submitted_vac:
-                    if not cond_vac:
-                        st.error("⚠️ Selecciona un conductor.")
-                    elif not reg_por_v.strip():
-                        st.error("⚠️ Ingresa tu nombre para registrar.")
-                    elif ff_vac < fi_vac:
-                        st.error("⚠️ La fecha fin no puede ser anterior a la fecha inicio.")
+            col_sel_cond, _ = st.columns([2, 2])
+            with col_sel_cond:
+                cond_vac_sel = st.selectbox("Conductor", lista_conductores_vac, key="vac_cond_sel_preview")
+
+            # Mostrar períodos pendientes del conductor seleccionado
+            info_cond_sel = df_info_todos[df_info_todos["conductor"] == cond_vac_sel].iloc[0] \
+                if not df_info_todos.empty and (df_info_todos["conductor"] == cond_vac_sel).any() else None
+
+            periodos_disponibles = []
+            if info_cond_sel is not None and info_cond_sel.get("fecha_ingreso") is not None:
+                fi_sel = pd.to_datetime(info_cond_sel["fecha_ingreso"]).date()
+                est_sel = calcular_estado_vacaciones(cond_vac_sel, fi_sel, df_vac_todos, hoy)
+
+                if est_sel["periodos_cumplidos"] == 0:
+                    st.info(f"⏳ **{cond_vac_sel}** aún no ha cumplido su primer año laboral. "
+                            f"Primer aniversario: **{est_sel['prox_aniv']}**")
+                else:
+                    pendientes_cond = [p for p in est_sel["periodos_estado"] if not p["tomado"]]
+                    tomados_cond    = [p for p in est_sel["periodos_estado"] if p["tomado"]]
+
+                    if pendientes_cond:
+                        st.warning(
+                            f"⚠️ **{cond_vac_sel}** tiene **{len(pendientes_cond)} período(s) pendiente(s)**: "
+                            + ", ".join(p["label"] for p in pendientes_cond)
+                        )
                     else:
-                        nuevo_id_v = db.registrar_vacacion({
-                            'conductor': cond_vac, 'fecha_inicio': fi_vac, 'fecha_fin': ff_vac,
-                            'dias': dias_vac, 'observaciones': obs_vac.strip(),
-                            'registrado_por': reg_por_v.strip()
-                        })
-                        if nuevo_id_v:
-                            st.success(f"✅ Vacaciones registradas para **{cond_vac}**: {fi_vac} → {ff_vac} ({dias_vac} días)")
-                            st.rerun()
+                        st.success(f"✅ **{cond_vac_sel}** tiene todos sus períodos al día.")
 
+                    periodos_disponibles = est_sel["periodos_estado"]
+            else:
+                st.warning(f"⚠️ **{cond_vac_sel}** no tiene fecha de ingreso registrada. "
+                           "Regístrala en la pestaña **⚙️ Fecha de ingreso** primero.")
+
+            st.divider()
+
+            if periodos_disponibles:
+                opciones_periodos = {
+                    p["label"] + (" ✅ (ya tomadas)" if p["tomado"] else " 🔴 (pendiente)"): p["anio_laboral"]
+                    for p in periodos_disponibles
+                }
+                with st.form("form_vacacion_v11", clear_on_submit=True):
+                    col1v, col2v = st.columns(2)
+                    with col1v:
+                        periodo_sel_label = st.selectbox(
+                            "Período anual al que corresponde esta vacación",
+                            list(opciones_periodos.keys()),
+                            key="vac_periodo_sel"
+                        )
+                        anio_laboral_sel = opciones_periodos[periodo_sel_label]
+                        fi_vac  = st.date_input("Fecha inicio vacaciones", value=datetime.today())
+                        ff_vac  = st.date_input("Fecha fin vacaciones",    value=datetime.today())
+                    with col2v:
+                        dias_auto = max(1, (ff_vac - fi_vac).days + 1) if ff_vac >= fi_vac else 1
+                        st.metric("Días calculados", dias_auto)
+                        dias_vac  = st.number_input("Días (editable)", min_value=1, max_value=60, value=dias_auto)
+                        reg_por_v = st.text_input("Registrado por", placeholder="Tu nombre completo")
+                        obs_vac   = st.text_area("Observaciones", height=80)
+
+                    submitted_vac = st.form_submit_button("💾 Registrar Vacaciones", type="primary")
+                    if submitted_vac:
+                        if not reg_por_v.strip():
+                            st.error("⚠️ Ingresa tu nombre.")
+                        elif ff_vac < fi_vac:
+                            st.error("⚠️ La fecha fin no puede ser anterior a la fecha inicio.")
+                        else:
+                            nuevo_id_v = db.registrar_vacacion({
+                                'conductor': cond_vac_sel,
+                                'fecha_inicio': fi_vac,
+                                'fecha_fin': ff_vac,
+                                'dias': dias_vac,
+                                'anio_laboral': anio_laboral_sel,
+                                'observaciones': obs_vac.strip(),
+                                'registrado_por': reg_por_v.strip()
+                            })
+                            if nuevo_id_v:
+                                st.success(
+                                    f"✅ Vacaciones registradas para **{cond_vac_sel}** "
+                                    f"(Año laboral {anio_laboral_sel}): "
+                                    f"{fi_vac} → {ff_vac} ({dias_vac} días)"
+                                )
+                                st.rerun()
+
+        # ---- FECHA DE INGRESO ----
         with v_tab3:
-            st.subheader("⚙️ Registrar/editar fecha de ingreso por conductor")
-            st.markdown("Esta fecha es necesaria para calcular los días acumulados de vacaciones.")
+            st.subheader("⚙️ Registrar / editar fecha de ingreso")
+            st.markdown("La fecha de ingreso es el punto de partida para calcular los períodos anuales.")
 
             with st.form("form_fecha_ingreso", clear_on_submit=True):
                 col1fi, col2fi = st.columns(2)
                 with col1fi:
-                    cond_fi     = st.selectbox("Conductor", lista_conductores_vac, key="fi_cond")
-                    fecha_ing   = st.date_input("Fecha de ingreso (contratación)", value=datetime.today())
+                    cond_fi   = st.selectbox("Conductor", lista_conductores_vac, key="fi_cond")
+                    fecha_ing = st.date_input("Fecha de ingreso (contratación)", value=datetime.today())
                 with col2fi:
                     obs_fi = st.text_area("Observaciones", height=80)
 
@@ -1282,28 +1470,30 @@ def main():
                         st.rerun()
 
             st.divider()
-            st.subheader("Fechas de ingreso registradas")
+            st.subheader("Fechas registradas")
             df_info_show = db.obtener_todos_info_conductores()
             if df_info_show.empty:
                 st.info("No hay fechas de ingreso registradas aún.")
             else:
                 for _, irow in df_info_show.iterrows():
-                    hoy = hora_colombia().date()
                     fi_d = pd.to_datetime(irow['fecha_ingreso']).date()
                     anios_t = round((hoy - fi_d).days / 365.25, 1)
-                    st.write(f"👤 **{irow['conductor']}** — Ingreso: {irow['fecha_ingreso']} — Antigüedad: {anios_t} años  |  {irow.get('observaciones','') or ''}")
+                    periodos_c = len(calcular_periodos_anuales(fi_d, hoy))
+                    st.write(
+                        f"👤 **{irow['conductor']}** — Ingreso: **{irow['fecha_ingreso']}** — "
+                        f"Antigüedad: {anios_t} años — Períodos cumplidos: **{periodos_c}**"
+                        + (f"  |  {irow['observaciones']}" if irow.get('observaciones') else "")
+                    )
 
     # ==================== TAB 5: PRÉSTAMOS ====================
     with tab_prest:
         st.header("💰 Gestión de Préstamos a Conductores")
-
         lista_conductores_prest = get_lista_conductores(db)
 
         p_tab1, p_tab2, p_tab3 = st.tabs(["📊 Resumen y trazabilidad", "➕ Nuevo préstamo", "💳 Registrar pago/descuento"])
 
         with p_tab1:
             st.subheader("Estado de préstamos")
-
             col_fp1, col_fp2, col_fp3 = st.columns(3)
             with col_fp1: filtro_cond_p  = st.selectbox("Conductor", ["Todos"] + lista_conductores_prest, key="p_filtro_cond")
             with col_fp2: filtro_estado_p = st.selectbox("Estado", ["Todos","activo","saldado"], key="p_filtro_estado")
@@ -1320,18 +1510,13 @@ def main():
             if df_prestamos_all.empty:
                 st.info("No se encontraron préstamos con los filtros aplicados.")
             else:
-                # Calcular saldos
                 total_prestado = int(df_prestamos_all["monto_total"].sum())
-                total_pagado_g = 0
-                total_saldo_g  = 0
-                activos_g      = 0
-                saldados_g     = 0
+                total_pagado_g = 0; total_saldo_g = 0; activos_g = 0; saldados_g = 0
                 for _, pr in df_prestamos_all.iterrows():
                     pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_all)
-                    total_pagado_g += pagado
-                    total_saldo_g  += saldo
-                    if pr['estado'] == 'activo': activos_g  += 1
-                    else:                        saldados_g += 1
+                    total_pagado_g += pagado; total_saldo_g += saldo
+                    if pr['estado'] == 'activo': activos_g += 1
+                    else: saldados_g += 1
 
                 col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
                 col_pm1.metric("Total prestado",  f"${fmt(total_prestado)}")
@@ -1339,54 +1524,36 @@ def main():
                 col_pm3.metric("Saldo pendiente", f"${fmt(total_saldo_g)}")
                 col_pm4.metric("Activos / Saldados", f"{activos_g} / {saldados_g}")
 
-                if total_saldo_g > 0:
-                    st.warning(f"💰 Saldo total pendiente de cobro: **${fmt(total_saldo_g)} COP**")
-
                 st.divider()
-
-                # Expanders por préstamo
                 for _, pr in df_prestamos_all.iterrows():
                     pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_all)
                     pct = round(pagado / pr['monto_total'] * 100) if pr['monto_total'] > 0 else 0
                     paz_salvo = pr['estado'] == 'saldado' or saldo == 0
                     icono_p = "✅" if paz_salvo else "🔴"
                     label_p = (f"{icono_p} ID {pr['id']} | {pr['conductor']} | "
-                               f"Préstamo: ${fmt(pr['monto_total'])} | Pagado: ${fmt(pagado)} | "
-                               f"Saldo: ${fmt(saldo)} | {pct}% | {pr['estado'].upper()}")
+                               f"${fmt(pr['monto_total'])} | Pagado: ${fmt(pagado)} | Saldo: ${fmt(saldo)} | {pct}%")
 
                     with st.expander(label_p):
                         col_pa, col_pb = st.columns([2, 2])
                         with col_pa:
-                            st.markdown(f"**Conductor:** {pr['conductor']}")
-                            st.write(f"📅 Fecha préstamo: {pr['fecha_prestamo']}")
-                            st.write(f"💰 Monto total: **${fmt(pr['monto_total'])} COP**")
-                            st.write(f"✅ Total pagado: **${fmt(pagado)} COP**")
-                            if saldo > 0:
-                                st.error(f"📋 Saldo pendiente: **${fmt(saldo)} COP** ({100-pct}% restante)")
-                            else:
-                                st.success("✅ PAZ Y SALVO — Préstamo cancelado en su totalidad")
-                            if pr.get('motivo'): st.write(f"📝 Motivo: {pr['motivo']}")
-                            if pr.get('observaciones'): st.write(f"📝 Obs: {pr['observaciones']}")
-
-                            # Barra de progreso
-                            st.progress(min(pct, 100) / 100, text=f"Progreso de pago: {pct}%")
-
-                            # Botón marcar paz y salvo manualmente
+                            st.write(f"💰 Monto: **${fmt(pr['monto_total'])} COP** | Pagado: **${fmt(pagado)}** | Saldo: **${fmt(saldo)}**")
+                            if saldo > 0: st.error(f"Saldo pendiente: **${fmt(saldo)} COP**")
+                            else: st.success("✅ PAZ Y SALVO")
+                            st.progress(min(pct, 100) / 100, text=f"{pct}%")
+                            if pr.get('motivo'): st.write(f"📝 {pr['motivo']}")
                             if not paz_salvo:
                                 col_btna, col_btnb = st.columns(2)
                                 with col_btna:
-                                    if st.button("✅ Marcar Paz y Salvo", key=f"paz_{pr['id']}", type="primary"):
-                                        db.actualizar_estado_prestamo(pr['id'], 'saldado')
-                                        st.success(f"✅ Préstamo ID {pr['id']} marcado como Paz y Salvo."); st.rerun()
+                                    if st.button("✅ Paz y Salvo", key=f"paz_{pr['id']}", type="primary"):
+                                        db.actualizar_estado_prestamo(pr['id'], 'saldado'); st.rerun()
                                 with col_btnb:
                                     if st.session_state.confirmar_eliminar_prestamo == pr['id']:
-                                        st.warning("¿Eliminar préstamo y todos sus pagos?")
+                                        st.warning("¿Eliminar?")
                                         c_s2, c_n2 = st.columns(2)
                                         with c_s2:
                                             if st.button("Sí", key=f"si_prest_{pr['id']}"):
                                                 db.eliminar_prestamo(pr['id'])
-                                                st.session_state.confirmar_eliminar_prestamo = None
-                                                st.success("Préstamo eliminado."); st.rerun()
+                                                st.session_state.confirmar_eliminar_prestamo = None; st.rerun()
                                         with c_n2:
                                             if st.button("No", key=f"no_prest_{pr['id']}"):
                                                 st.session_state.confirmar_eliminar_prestamo = None; st.rerun()
@@ -1394,36 +1561,32 @@ def main():
                                         if st.button("🗑️ Eliminar", key=f"del_prest_{pr['id']}"):
                                             st.session_state.confirmar_eliminar_prestamo = pr['id']; st.rerun()
                             else:
-                                if st.button("↩️ Reabrir préstamo", key=f"reabrir_{pr['id']}"):
+                                if st.button("↩️ Reabrir", key=f"reabrir_{pr['id']}"):
                                     db.actualizar_estado_prestamo(pr['id'], 'activo'); st.rerun()
-
                         with col_pb:
-                            st.markdown("**Historial de pagos / descuentos:**")
+                            st.markdown("**Historial de pagos:**")
                             df_pagos_p = df_pagos_all[df_pagos_all["prestamo_id"] == pr['id']] if not df_pagos_all.empty else pd.DataFrame()
                             if df_pagos_p.empty:
-                                st.info("No hay pagos registrados aún.")
+                                st.info("Sin pagos registrados.")
                             else:
                                 saldo_acum = int(pr['monto_total'])
                                 for _, pg in df_pagos_p.sort_values("fecha_pago").iterrows():
                                     saldo_acum -= int(pg['monto_pago'])
                                     col_pgr = st.columns([3, 1])
                                     with col_pgr[0]:
-                                        st.write(f"💳 {pg['fecha_pago']} — Descuento: **${fmt(pg['monto_pago'])}** — Saldo restante: **${fmt(max(0,saldo_acum))}**"
-                                                 + (f" | {pg['observaciones']}" if pg.get('observaciones') else ""))
+                                        st.write(f"💳 {pg['fecha_pago']} — ${fmt(pg['monto_pago'])} — Saldo: ${fmt(max(0,saldo_acum))}")
                                     with col_pgr[1]:
                                         if st.session_state.confirmar_eliminar_pago == pg['id']:
-                                            st.warning("¿Eliminar?")
                                             c_s3, c_n3 = st.columns(2)
                                             with c_s3:
                                                 if st.button("Sí", key=f"si_pago_{pg['id']}"):
                                                     db.eliminar_pago(pg['id'])
-                                                    st.session_state.confirmar_eliminar_pago = None
-                                                    st.success("Pago eliminado."); st.rerun()
+                                                    st.session_state.confirmar_eliminar_pago = None; st.rerun()
                                             with c_n3:
                                                 if st.button("No", key=f"no_pago_{pg['id']}"):
                                                     st.session_state.confirmar_eliminar_pago = None; st.rerun()
                                         else:
-                                            if st.button("🗑️", key=f"del_pago_{pg['id']}", help="Eliminar pago"):
+                                            if st.button("🗑️", key=f"del_pago_{pg['id']}"):
                                                 st.session_state.confirmar_eliminar_pago = pg['id']; st.rerun()
 
                 st.divider()
@@ -1440,102 +1603,82 @@ def main():
             with st.form("form_prestamo", clear_on_submit=True):
                 col1p, col2p = st.columns(2)
                 with col1p:
-                    cond_nuevo_p  = st.selectbox("Conductor", lista_conductores_prest, key="p_cond_nuevo")
-                    fecha_prest   = st.date_input("Fecha del préstamo", value=datetime.today())
-                    monto_prest_txt = st.text_input("Monto del préstamo (COP)", placeholder="Ej: 500.000")
-                    monto_prest   = limpiar(monto_prest_txt)
+                    cond_nuevo_p    = st.selectbox("Conductor", lista_conductores_prest, key="p_cond_nuevo")
+                    fecha_prest     = st.date_input("Fecha del préstamo", value=datetime.today())
+                    monto_prest_txt = st.text_input("Monto (COP)", placeholder="Ej: 500.000")
+                    monto_prest     = limpiar(monto_prest_txt)
                     if monto_prest > 0: st.caption(f"💵 {fmt(monto_prest)} COP")
                 with col2p:
-                    motivo_prest  = st.text_input("Motivo del préstamo", placeholder="Ej: Urgencia médica, anticipo salario...")
-                    obs_prest     = st.text_area("Observaciones", height=80)
+                    motivo_prest = st.text_input("Motivo", placeholder="Ej: Urgencia médica...")
+                    obs_prest    = st.text_area("Observaciones", height=80)
 
-                btn_prest = st.form_submit_button("💾 Registrar Préstamo", type="primary")
-                if btn_prest:
+                if st.form_submit_button("💾 Registrar Préstamo", type="primary"):
                     if monto_prest <= 0:
                         st.error("⚠️ El monto debe ser mayor a 0.")
                     else:
                         nid_p = db.registrar_prestamo({
-                            'conductor': cond_nuevo_p,
-                            'monto_total': monto_prest,
-                            'fecha_prestamo': fecha_prest,
-                            'motivo': motivo_prest.strip(),
+                            'conductor': cond_nuevo_p, 'monto_total': monto_prest,
+                            'fecha_prestamo': fecha_prest, 'motivo': motivo_prest.strip(),
                             'observaciones': obs_prest.strip()
                         })
                         if nid_p:
-                            st.success(f"✅ Préstamo registrado (ID: {nid_p}) para **{cond_nuevo_p}** por **${fmt(monto_prest)} COP**")
+                            st.success(f"✅ Préstamo ID {nid_p} registrado para **{cond_nuevo_p}** — ${fmt(monto_prest)} COP")
                             st.rerun()
 
         with p_tab3:
-            st.subheader("Registrar pago / descuento a un préstamo")
-            st.markdown("Selecciona el préstamo activo del conductor al que deseas aplicar un descuento.")
-
-            # Mostrar solo préstamos activos con saldo
-            df_activos = db.obtener_prestamos(estado="activo")
-            df_pagos_check = db.obtener_pagos()
-
+            st.subheader("Registrar pago / descuento")
+            df_activos   = db.obtener_prestamos(estado="activo")
+            df_pagos_chk = db.obtener_pagos()
             if df_activos.empty:
-                st.success("✅ No hay préstamos activos en este momento.")
+                st.success("✅ No hay préstamos activos.")
             else:
                 opciones_prestamos = []
                 for _, pr in df_activos.iterrows():
-                    pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_check)
+                    pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_chk)
                     if saldo > 0:
                         opciones_prestamos.append({
                             "id": pr['id'],
-                            "label": f"ID {pr['id']} | {pr['conductor']} | Saldo: ${fmt(saldo)} de ${fmt(pr['monto_total'])}",
-                            "saldo": saldo,
-                            "conductor": pr['conductor'],
-                            "monto_total": pr['monto_total']
+                            "label": f"ID {pr['id']} | {pr['conductor']} | Saldo: ${fmt(saldo)}",
+                            "saldo": saldo, "conductor": pr['conductor'], "monto_total": pr['monto_total']
                         })
-
                 if not opciones_prestamos:
-                    st.success("✅ Todos los préstamos activos están saldados. Marca los como Paz y Salvo en la pestaña de Resumen.")
+                    st.success("✅ Todos los préstamos activos están saldados.")
                 else:
                     with st.form("form_pago", clear_on_submit=True):
-                        prestamo_sel_idx = st.selectbox(
-                            "Selecciona el préstamo",
-                            range(len(opciones_prestamos)),
-                            format_func=lambda i: opciones_prestamos[i]["label"],
-                            key="p_sel_pago"
-                        )
-                        op_sel = opciones_prestamos[prestamo_sel_idx]
-                        st.info(f"💰 Saldo actual del préstamo seleccionado: **${fmt(op_sel['saldo'])} COP**")
-
+                        p_idx = st.selectbox("Préstamo", range(len(opciones_prestamos)),
+                            format_func=lambda i: opciones_prestamos[i]["label"], key="p_sel_pago")
+                        op = opciones_prestamos[p_idx]
+                        st.info(f"Saldo actual: **${fmt(op['saldo'])} COP**")
                         col1pg, col2pg = st.columns(2)
                         with col1pg:
-                            fecha_pago    = st.date_input("Fecha del descuento", value=datetime.today())
-                            monto_pago_txt = st.text_input("Monto del descuento (COP)", placeholder="Ej: 50.000")
-                            monto_pago    = limpiar(monto_pago_txt)
+                            fecha_pago     = st.date_input("Fecha del descuento", value=datetime.today())
+                            monto_pago_txt = st.text_input("Monto del descuento (COP)")
+                            monto_pago     = limpiar(monto_pago_txt)
                             if monto_pago > 0:
-                                saldo_restante = max(0, op_sel['saldo'] - monto_pago)
-                                st.caption(f"💵 Descuento: {fmt(monto_pago)} COP — Saldo restante: **{fmt(saldo_restante)} COP**")
+                                st.caption(f"Saldo restante: **${fmt(max(0, op['saldo'] - monto_pago))} COP**")
                         with col2pg:
-                            reg_por_pg = st.text_input("Registrado por", placeholder="Tu nombre completo")
-                            obs_pg     = st.text_area("Observaciones", height=80, placeholder="Nómina julio, descuento quincenal...")
+                            reg_por_pg = st.text_input("Registrado por")
+                            obs_pg     = st.text_area("Observaciones", height=80)
 
-                        btn_pago = st.form_submit_button("💳 Registrar Descuento", type="primary")
-                        if btn_pago:
+                        if st.form_submit_button("💳 Registrar Descuento", type="primary"):
                             if monto_pago <= 0:
-                                st.error("⚠️ El monto del descuento debe ser mayor a 0.")
-                            elif monto_pago > op_sel['saldo']:
-                                st.error(f"⚠️ El descuento (${fmt(monto_pago)}) supera el saldo (${fmt(op_sel['saldo'])}). Ajusta el valor.")
+                                st.error("⚠️ Monto debe ser mayor a 0.")
+                            elif monto_pago > op['saldo']:
+                                st.error(f"⚠️ Supera el saldo (${fmt(op['saldo'])}).")
                             elif not reg_por_pg.strip():
-                                st.error("⚠️ Ingresa tu nombre para registrar.")
+                                st.error("⚠️ Ingresa tu nombre.")
                             else:
                                 nid_pg = db.registrar_pago({
-                                    'prestamo_id': op_sel['id'],
-                                    'monto_pago': monto_pago,
-                                    'fecha_pago': fecha_pago,
-                                    'observaciones': obs_pg.strip(),
+                                    'prestamo_id': op['id'], 'monto_pago': monto_pago,
+                                    'fecha_pago': fecha_pago, 'observaciones': obs_pg.strip(),
                                     'registrado_por': reg_por_pg.strip()
                                 })
                                 if nid_pg:
-                                    nuevo_saldo = max(0, op_sel['saldo'] - monto_pago)
-                                    st.success(f"✅ Descuento de **${fmt(monto_pago)} COP** registrado para **{op_sel['conductor']}**. Saldo restante: **${fmt(nuevo_saldo)} COP**")
-                                    # Auto marcar paz y salvo
+                                    nuevo_saldo = max(0, op['saldo'] - monto_pago)
+                                    st.success(f"✅ Descuento registrado. Saldo: **${fmt(nuevo_saldo)} COP**")
                                     if nuevo_saldo == 0:
-                                        db.actualizar_estado_prestamo(op_sel['id'], 'saldado')
-                                        st.success(f"🎉 ¡**{op_sel['conductor']}** quedó **PAZ Y SALVO** con este préstamo!")
+                                        db.actualizar_estado_prestamo(op['id'], 'saldado')
+                                        st.success(f"🎉 **{op['conductor']}** — PAZ Y SALVO")
                                     st.rerun()
 
     # ==================== TAB 6: CLIENTES ====================
@@ -1546,9 +1689,8 @@ def main():
         for i, c_def in enumerate(CLIENTES_DEFAULT):
             with cols[i]: st.info(c_def)
         st.divider()
-        st.subheader("Agregar cliente nuevo")
         with st.form("form_nuevo_cliente", clear_on_submit=True):
-            nuevo_cliente = st.text_input("Nombre del cliente", placeholder="Ej: LOGÍSTICA DEL NORTE")
+            nuevo_cliente = st.text_input("Nombre del cliente nuevo")
             if st.form_submit_button("➕ Agregar Cliente", type="primary"):
                 if not nuevo_cliente.strip():
                     st.error("⚠️ El nombre no puede estar vacío.")
@@ -1559,7 +1701,6 @@ def main():
                     if ok: st.success(f"✅ Cliente **{nuevo_cliente.strip().upper()}** agregado."); st.rerun()
                     else: st.error("❌ Ya existe o hubo un error.")
         st.divider()
-        st.subheader("Clientes adicionales registrados")
         df_extras = db.obtener_clientes_extra()
         if df_extras.empty:
             st.info("No hay clientes adicionales aún.")
@@ -1567,39 +1708,30 @@ def main():
             for _, row in df_extras.iterrows():
                 col_n, col_f, col_b = st.columns([3, 2, 1])
                 with col_n: st.write(f"**{row['nombre']}**")
-                with col_f: st.write(f"Registrado: {str(row['fecha_registro'])[:16]}")
+                with col_f: st.write(str(row['fecha_registro'])[:16])
                 with col_b:
                     if st.session_state.confirmar_eliminar_cliente == row['id']:
-                        st.warning("¿Eliminar?")
                         c_si, c_no = st.columns(2)
                         with c_si:
                             if st.button("Sí", key=f"si_cli_{row['id']}"):
-                                db.eliminar_cliente(row['id']); st.session_state.confirmar_eliminar_cliente = None
-                                st.success("Eliminado."); st.rerun()
+                                db.eliminar_cliente(row['id']); st.session_state.confirmar_eliminar_cliente = None; st.rerun()
                         with c_no:
                             if st.button("No", key=f"no_cli_{row['id']}"):
                                 st.session_state.confirmar_eliminar_cliente = None; st.rerun()
                     else:
                         if st.button("🗑️", key=f"del_cli_{row['id']}"):
                             st.session_state.confirmar_eliminar_cliente = row['id']; st.rerun()
-        st.divider()
-        st.subheader("Lista completa")
-        for c in get_lista_clientes(db): st.write(f"• {c}")
 
     # ==================== TAB 7: CONDUCTORES ====================
     with tab_conductores:
         st.header("👤 Gestión de Conductores")
-        st.markdown("Agrega, edita o elimina conductores adicionales.")
-
         st.subheader("Conductores predeterminados")
         cols_def = st.columns(4)
         for i, c_def in enumerate(sorted(CONDUCTORES_DEFAULT)):
             with cols_def[i % 4]: st.info(c_def)
-
         st.divider()
-        st.subheader("Agregar conductor nuevo")
         with st.form("form_nuevo_conductor", clear_on_submit=True):
-            nuevo_conductor = st.text_input("Nombre del conductor", placeholder="Ej: JUAN PABLO GOMEZ")
+            nuevo_conductor = st.text_input("Nombre del conductor nuevo")
             if st.form_submit_button("➕ Agregar Conductor", type="primary"):
                 if not nuevo_conductor.strip():
                     st.error("⚠️ El nombre no puede estar vacío.")
@@ -1607,11 +1739,9 @@ def main():
                     st.warning("⚠️ Ya existe en la lista predeterminada.")
                 else:
                     ok = db.agregar_conductor(nuevo_conductor.strip())
-                    if ok: st.success(f"✅ Conductor **{nuevo_conductor.strip().upper()}** agregado."); st.rerun()
+                    if ok: st.success(f"✅ **{nuevo_conductor.strip().upper()}** agregado."); st.rerun()
                     else: st.error("❌ Ya existe o hubo un error.")
-
         st.divider()
-        st.subheader("Conductores adicionales registrados")
         df_conductores = db.obtener_conductores_extra()
         if df_conductores.empty:
             st.info("No hay conductores adicionales registrados aún.")
@@ -1625,41 +1755,34 @@ def main():
                     else:
                         st.write(f"**{row['nombre']}**")
                 with col_fecha:
-                    st.write(f"Registrado: {str(row['fecha_registro'])[:16]}")
+                    st.write(str(row['fecha_registro'])[:16])
                 with col_edit:
                     if st.session_state.editando_conductor_id == row['id']:
-                        if st.button("💾", key=f"save_cond_{row['id']}", help="Guardar cambios"):
+                        if st.button("💾", key=f"save_cond_{row['id']}"):
                             if nombre_editado.strip():
                                 ok = db.editar_conductor(row['id'], nombre_editado.strip())
                                 if ok:
-                                    st.success(f"✅ Actualizado a **{nombre_editado.strip().upper()}**")
                                     st.session_state.editando_conductor_id = None; st.rerun()
-                            else: st.error("El nombre no puede estar vacío.")
                     else:
-                        if st.button("✏️", key=f"edit_cond_{row['id']}", help="Editar nombre"):
-                            st.session_state.editando_conductor_id = row['id']
-                            st.session_state.confirmar_eliminar_conductor = None; st.rerun()
+                        if st.button("✏️", key=f"edit_cond_{row['id']}"):
+                            st.session_state.editando_conductor_id = row['id']; st.rerun()
                 with col_del:
                     if st.session_state.editando_conductor_id == row['id']:
-                        if st.button("✖", key=f"cancel_cond_{row['id']}", help="Cancelar edición"):
+                        if st.button("✖", key=f"cancel_cond_{row['id']}"):
                             st.session_state.editando_conductor_id = None; st.rerun()
                     elif st.session_state.confirmar_eliminar_conductor == row['id']:
-                        st.warning("¿Eliminar?")
                         c_si2, c_no2 = st.columns(2)
                         with c_si2:
                             if st.button("Sí", key=f"si_cond_{row['id']}"):
-                                db.eliminar_conductor(row['id']); st.session_state.confirmar_eliminar_conductor = None
-                                st.success("Conductor eliminado."); st.rerun()
+                                db.eliminar_conductor(row['id']); st.session_state.confirmar_eliminar_conductor = None; st.rerun()
                         with c_no2:
                             if st.button("No", key=f"no_cond_{row['id']}"):
                                 st.session_state.confirmar_eliminar_conductor = None; st.rerun()
                     else:
-                        if st.button("🗑️", key=f"del_cond_{row['id']}", help="Eliminar conductor"):
-                            st.session_state.confirmar_eliminar_conductor = row['id']
-                            st.session_state.editando_conductor_id = None; st.rerun()
+                        if st.button("🗑️", key=f"del_cond_{row['id']}"):
+                            st.session_state.confirmar_eliminar_conductor = row['id']; st.rerun()
 
         st.divider()
-        st.subheader("Lista completa de conductores")
         todos_conductores = get_lista_conductores(db)
         cols_todos = st.columns(3)
         for i, c in enumerate(todos_conductores):

@@ -1,11 +1,13 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v11: Vacaciones por períodos anuales (aniversario) con alertas de vencimiento
+v12: Vacaciones 15 días/año, días vencidos, próxima fecha, editar/eliminar
+     Optimización: connection pooling, caché con st.cache_data
 """
 
 import streamlit as st
 import psycopg2
+from psycopg2 import pool
 import pandas as pd
 from datetime import datetime, timedelta, date
 from io import BytesIO
@@ -15,6 +17,7 @@ from openpyxl.utils import get_column_letter
 
 # ==================== CONFIGURACIÓN ====================
 SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
+DIAS_VACACIONES_ANUALES = 15
 
 # ==================== FORMATO COLOMBIANO ====================
 def fmt(valor):
@@ -35,6 +38,23 @@ def limpiar(texto):
 
 def hora_colombia():
     return datetime.utcnow() - timedelta(hours=5)
+
+# ==================== CONNECTION POOL (singleton) ====================
+@st.cache_resource
+def get_pool():
+    return psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=SUPABASE_DB_URL,
+        connect_timeout=10,
+        options="-c statement_timeout=15000"
+    )
+
+def get_conn():
+    return get_pool().getconn()
+
+def put_conn(conn):
+    get_pool().putconn(conn)
 
 # ==================== ALERTAS ANTICIPOS ====================
 def clasificar_alerta(fecha_viaje):
@@ -59,17 +79,13 @@ def badge_alerta(dias, nivel):
     else:
         return f"🟢 {dias}d"
 
-# ==================== LÓGICA DE VACACIONES POR PERÍODOS ANUALES ====================
+# ==================== LÓGICA VACACIONES v12 ====================
 
 def calcular_periodos_anuales(fecha_ingreso: date, hoy: date) -> list:
     """
-    Genera la lista de todos los períodos anuales desde la fecha de ingreso hasta hoy.
-    Cada período corresponde a un año laboral: ingreso+N → ingreso+(N+1)
-    Retorna lista de dicts: {anio_laboral, inicio, fin, vencimiento}
-    - anio_laboral: número de año (1 = primer año, 2 = segundo, etc.)
-    - inicio: fecha inicio del período
-    - fin: fecha fin del período
-    - vencimiento: fecha en que se debe tomar la vacación (fin del período = aniversario)
+    Genera todos los períodos anuales cumplidos desde la fecha de ingreso.
+    Cada período: ingreso+N → ingreso+(N+1)
+    Retorna lista de dicts con anio_laboral, inicio, fin, label
     """
     periodos = []
     n = 1
@@ -82,8 +98,6 @@ def calcular_periodos_anuales(fecha_ingreso: date, hoy: date) -> list:
             fin = fecha_ingreso.replace(year=fecha_ingreso.year + n)
         except ValueError:
             fin = date(fecha_ingreso.year + n, fecha_ingreso.month, 28)
-
-        # Solo períodos ya cumplidos (el aniversario ya pasó)
         if fin > hoy:
             break
         periodos.append({
@@ -96,22 +110,29 @@ def calcular_periodos_anuales(fecha_ingreso: date, hoy: date) -> list:
     return periodos
 
 
+def calcular_proxima_vacacion(fecha_ingreso: date, hoy: date) -> date:
+    """Retorna la fecha del próximo aniversario (derecho a vacaciones)."""
+    periodos = calcular_periodos_anuales(fecha_ingreso, hoy)
+    n_siguiente = len(periodos) + 1
+    try:
+        return fecha_ingreso.replace(year=fecha_ingreso.year + n_siguiente)
+    except ValueError:
+        return date(fecha_ingreso.year + n_siguiente, fecha_ingreso.month, 28)
+
+
 def calcular_estado_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.DataFrame, hoy: date) -> dict:
     """
-    Para un conductor con su fecha de ingreso, determina:
-    - Períodos cumplidos (años laborales completos)
-    - Cuáles tienen vacaciones registradas
-    - Cuáles están vencidos (sin vacaciones)
-    - Cuántos días lleva vencido el período más antiguo sin tomar
+    Calcula:
+    - Períodos cumplidos, tomados, vencidos
+    - Días totales vencidos (períodos_vencidos × 15)
+    - Días transcurridos desde el vencimiento más antiguo sin tomar
+    - Próxima fecha de vacaciones
     """
     periodos = calcular_periodos_anuales(fecha_ingreso, hoy)
-
-    # Vacaciones de este conductor
     vac_cond = df_vac[df_vac["conductor"] == conductor] if not df_vac.empty else pd.DataFrame()
 
     periodos_estado = []
     for p in periodos:
-        # Buscar si existe alguna vacación registrada para este período anual
         tomado = False
         registros = []
         if not vac_cond.empty and "anio_laboral" in vac_cond.columns:
@@ -124,28 +145,29 @@ def calcular_estado_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.D
     periodos_vencidos = [p for p in periodos_estado if not p["tomado"]]
     periodos_tomados  = [p for p in periodos_estado if p["tomado"]]
 
+    # Días vencidos totales (15 días × períodos sin tomar)
+    dias_vencidos_total = len(periodos_vencidos) * DIAS_VACACIONES_ANUALES
+
     # Días desde que venció el período más antiguo sin tomar
-    dias_vencido_max = 0
+    dias_desde_vencimiento = 0
+    vencimiento_mas_antiguo = None
     if periodos_vencidos:
         vencimiento_mas_antiguo = periodos_vencidos[0]["fin"]
-        dias_vencido_max = (hoy - vencimiento_mas_antiguo).days
+        dias_desde_vencimiento = (hoy - vencimiento_mas_antiguo).days
 
-    # Próximo aniversario (siguiente período que aún no se cumple)
-    n_siguiente = len(periodos) + 1
-    try:
-        prox_aniv = fecha_ingreso.replace(year=fecha_ingreso.year + n_siguiente)
-    except ValueError:
-        prox_aniv = date(fecha_ingreso.year + n_siguiente, fecha_ingreso.month, 28)
-    dias_prox = (prox_aniv - hoy).days
+    prox_vac = calcular_proxima_vacacion(fecha_ingreso, hoy)
+    dias_prox = (prox_vac - hoy).days
 
     return {
-        "periodos_cumplidos": len(periodos),
-        "periodos_tomados": len(periodos_tomados),
-        "periodos_vencidos": len(periodos_vencidos),
-        "periodos_estado": periodos_estado,
-        "dias_vencido_max": dias_vencido_max,
-        "prox_aniv": prox_aniv,
-        "dias_prox": dias_prox,
+        "periodos_cumplidos":      len(periodos),
+        "periodos_tomados":        len(periodos_tomados),
+        "periodos_vencidos":       len(periodos_vencidos),
+        "dias_vencidos_total":     dias_vencidos_total,
+        "dias_desde_vencimiento":  dias_desde_vencimiento,
+        "vencimiento_mas_antiguo": vencimiento_mas_antiguo,
+        "periodos_estado":         periodos_estado,
+        "prox_vac":                prox_vac,
+        "dias_prox":               dias_prox,
     }
 
 
@@ -235,6 +257,7 @@ def generar_excel(df: pd.DataFrame, titulo: str = "Anticipos") -> BytesIO:
     ws.freeze_panes = f"A{row_header + 1}"
     output = BytesIO(); wb.save(output); output.seek(0)
     return output
+
 
 # ==================== EXPORTAR EXCEL PRÉSTAMOS ====================
 def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) -> BytesIO:
@@ -327,15 +350,15 @@ def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) 
     output = BytesIO(); wb.save(output); output.seek(0)
     return output
 
-# ==================== EXPORTAR EXCEL VACACIONES (v11) ====================
-def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, conductores: list) -> BytesIO:
+
+# ==================== EXPORTAR EXCEL VACACIONES v12 ====================
+def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, conductores: list) -> BytesIO:
     wb = Workbook()
     ws = wb.active
     ws.title = "Vacaciones"
     color_h    = "1F4E79"
     color_venc = "FCE4EC"
     color_ok_  = "E8F5E9"
-    color_pend = "FFF9C4"
     fh = Font(name="Arial", bold=True, color="FFFFFF", size=10)
     fn = Font(name="Arial", size=9)
     ft = Font(name="Arial", bold=True, size=13, color="1F4E79")
@@ -343,12 +366,13 @@ def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, co
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
     left_a = Alignment(horizontal="left",   vertical="center")
-    ws.merge_cells("A1:H1")
-    ws["A1"] = f"Reporte de Vacaciones (por períodos anuales) — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
+    ws.merge_cells("A1:I1")
+    ws["A1"] = f"Reporte de Vacaciones — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
     ws["A1"].font = ft; ws["A1"].alignment = center
 
     cols = ["Conductor","Fecha ingreso","Períodos cumplidos","Períodos tomados",
-            "Períodos vencidos","Días vencidos (más antiguo)","Próx. aniversario","Estado"]
+            "Períodos vencidos","Días vencidos (total)","Días desde vencimiento",
+            "Próxima vacación","Estado"]
     rh = 3
     for ci, cn in enumerate(cols, 1):
         cell = ws.cell(row=rh, column=ci, value=cn)
@@ -358,7 +382,8 @@ def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, co
 
     hoy = hora_colombia().date()
     for ri, cond in enumerate(sorted(conductores), start=rh+1):
-        info_row = df_info[df_info["conductor"]==cond].iloc[0] if not df_info.empty and (df_info["conductor"]==cond).any() else None
+        info_row = df_info[df_info["conductor"]==cond].iloc[0] \
+            if not df_info.empty and (df_info["conductor"]==cond).any() else None
         if info_row is not None and info_row.get("fecha_ingreso") is not None:
             fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
             est = calcular_estado_vacaciones(cond, fi, df_vac, hoy)
@@ -367,20 +392,21 @@ def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, co
             valores = [
                 cond, str(fi),
                 est["periodos_cumplidos"], est["periodos_tomados"],
-                est["periodos_vencidos"], est["dias_vencido_max"],
-                str(est["prox_aniv"]), estado_txt
+                est["periodos_vencidos"], est["dias_vencidos_total"],
+                est["dias_desde_vencimiento"],
+                str(est["prox_vac"]), estado_txt
             ]
         else:
             fill_color = "F3F3F3"
-            valores = [cond, "—", "—", "—", "—", "—", "—", "Sin fecha ingreso"]
+            valores = [cond, "—", "—", "—", "—", "—", "—", "—", "Sin fecha ingreso"]
 
         fill = PatternFill("solid", fgColor=fill_color)
         for ci, val in enumerate(valores, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
             cell.fill = fill; cell.border = border; cell.font = fn
-            cell.alignment = center if ci in [3,4,5,6,8] else left_a
+            cell.alignment = center if ci in [3,4,5,6,7,9] else left_a
 
-    anchos = [28,14,18,16,16,22,18,18]
+    anchos = [28,14,18,16,16,16,20,18,12]
     for ci, aw in enumerate(anchos, 1):
         ws.column_dimensions[get_column_letter(ci)].width = aw
     ws.freeze_panes = f"A{rh+1}"
@@ -398,7 +424,8 @@ def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, co
 
     ri2 = 4
     for cond in sorted(conductores):
-        info_row = df_info[df_info["conductor"]==cond].iloc[0] if not df_info.empty and (df_info["conductor"]==cond).any() else None
+        info_row = df_info[df_info["conductor"]==cond].iloc[0] \
+            if not df_info.empty and (df_info["conductor"]==cond).any() else None
         if info_row is None or info_row.get("fecha_ingreso") is None:
             continue
         fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
@@ -418,7 +445,10 @@ def generar_excel_vacaciones_v11(df_info: pd.DataFrame, df_vac: pd.DataFrame, co
                     ri2 += 1
             else:
                 fill2 = PatternFill("solid", fgColor=color_venc)
-                vals2 = [cond, p["anio_laboral"], p["label"], "NO TOMADAS", "", "", "VENCIDA"]
+                dias_desde = (hoy - p["fin"]).days
+                vals2 = [cond, p["anio_laboral"], p["label"],
+                         "NO TOMADAS", "", DIAS_VACACIONES_ANUALES,
+                         f"VENCIDA hace {dias_desde} días"]
                 for ci, val in enumerate(vals2, 1):
                     cell = ws2.cell(row=ri2, column=ci, value=val)
                     cell.fill = fill2; cell.border = border; cell.font = fn
@@ -453,18 +483,45 @@ CLIENTES_DEFAULT = [
     "GLOBO EXPRESS","MOTOTRANSPORTAMOS","CARGO ANDINA","TRANSOLICAR","SUCLOGISTIC",
 ]
 
+
 # ==================== BASE DE DATOS ====================
 class DB:
-    def __init__(self):
-        self.url = SUPABASE_DB_URL
-        self._init_tablas()
-
-    def conn(self):
-        return psycopg2.connect(self.url)
-
-    def _init_tablas(self):
+    def _exec(self, query, params=None, fetch=None):
+        """Ejecuta una query reutilizando conexión del pool."""
+        conn = get_conn()
         try:
-            c = self.conn(); cur = c.cursor()
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if fetch == "all":
+                return cur.fetchall(), [d[0] for d in cur.description]
+            elif fetch == "one":
+                return cur.fetchone()
+            else:
+                conn.commit()
+                return True
+        except Exception as e:
+            conn.rollback()
+            st.error(f"DB error: {e}")
+            return None
+        finally:
+            put_conn(conn)
+
+    def _query_df(self, query, params=None):
+        """Retorna un DataFrame desde una query SELECT."""
+        conn = get_conn()
+        try:
+            df = pd.read_sql_query(query, conn, params=params)
+            return df
+        except Exception as e:
+            st.error(f"DB query error: {e}")
+            return pd.DataFrame()
+        finally:
+            put_conn(conn)
+
+    def init_tablas(self):
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS anticipos_v1 (
                     id SERIAL PRIMARY KEY,
@@ -507,7 +564,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # ---- VACACIONES v11: columna anio_laboral ----
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS vacaciones (
                     id SERIAL PRIMARY KEY,
@@ -521,7 +577,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # Migración: agregar columna si ya existía la tabla sin ella
             cur.execute("ALTER TABLE vacaciones ADD COLUMN IF NOT EXISTS anio_laboral INTEGER")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS prestamos (
@@ -546,122 +601,78 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            c.commit(); c.close()
+            conn.commit()
         except Exception as e:
+            conn.rollback()
             st.error(f"Error inicializando tablas: {e}")
+        finally:
+            put_conn(conn)
 
     # ---- Clientes ----
     def obtener_clientes_extra(self):
-        try:
-            c = self.conn()
-            df = pd.read_sql_query("SELECT * FROM clientes_extra ORDER BY nombre", c)
-            c.close(); return df
-        except:
-            return pd.DataFrame(columns=['id','nombre','fecha_registro'])
+        return self._query_df("SELECT * FROM clientes_extra ORDER BY nombre")
 
     def agregar_cliente(self, nombre):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
-                        (nombre.strip().upper(), hora_colombia()))
-            c.commit(); c.close(); return True
-        except:
-            return False
+        return bool(self._exec(
+            "INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
+            (nombre.strip().upper(), hora_colombia())
+        ))
 
     def eliminar_cliente(self, cliente_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM clientes_extra WHERE id = %s", (cliente_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando cliente: {e}")
+        self._exec("DELETE FROM clientes_extra WHERE id = %s", (cliente_id,))
 
     # ---- Conductores extra ----
     def obtener_conductores_extra(self):
-        try:
-            c = self.conn()
-            df = pd.read_sql_query("SELECT * FROM conductores_extra ORDER BY nombre", c)
-            c.close(); return df
-        except:
-            return pd.DataFrame(columns=['id','nombre','fecha_registro'])
+        return self._query_df("SELECT * FROM conductores_extra ORDER BY nombre")
 
     def agregar_conductor(self, nombre):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
-                        (nombre.strip().upper(), hora_colombia()))
-            c.commit(); c.close(); return True
-        except:
-            return False
+        return bool(self._exec(
+            "INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
+            (nombre.strip().upper(), hora_colombia())
+        ))
 
     def editar_conductor(self, conductor_id, nombre_nuevo):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("UPDATE conductores_extra SET nombre = %s WHERE id = %s",
-                        (nombre_nuevo.strip().upper(), conductor_id))
-            c.commit(); c.close(); return True
-        except Exception as e:
-            st.error(f"Error editando conductor: {e}"); return False
+        return bool(self._exec(
+            "UPDATE conductores_extra SET nombre = %s WHERE id = %s",
+            (nombre_nuevo.strip().upper(), conductor_id)
+        ))
 
     def eliminar_conductor(self, conductor_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM conductores_extra WHERE id = %s", (conductor_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando conductor: {e}")
+        self._exec("DELETE FROM conductores_extra WHERE id = %s", (conductor_id,))
 
     # ---- Conductores info ----
     def obtener_info_conductor(self, conductor):
-        try:
-            c = self.conn()
-            df = pd.read_sql_query("SELECT * FROM conductores_info WHERE conductor = %s", c, params=(conductor,))
-            c.close()
-            return df.iloc[0] if not df.empty else None
-        except:
-            return None
+        df = self._query_df("SELECT * FROM conductores_info WHERE conductor = %s", (conductor,))
+        return df.iloc[0] if not df.empty else None
 
     def obtener_todos_info_conductores(self):
-        try:
-            c = self.conn()
-            df = pd.read_sql_query("SELECT * FROM conductores_info ORDER BY conductor", c)
-            c.close(); return df
-        except:
-            return pd.DataFrame(columns=['id','conductor','fecha_ingreso','observaciones','fecha_registro'])
+        return self._query_df("SELECT * FROM conductores_info ORDER BY conductor")
 
     def guardar_info_conductor(self, conductor, fecha_ingreso, observaciones=""):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("""
-                INSERT INTO conductores_info (conductor, fecha_ingreso, observaciones, fecha_registro)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (conductor) DO UPDATE
-                SET fecha_ingreso = EXCLUDED.fecha_ingreso,
-                    observaciones = EXCLUDED.observaciones
-            """, (conductor.strip().upper(), fecha_ingreso, observaciones.strip(), hora_colombia()))
-            c.commit(); c.close(); return True
-        except Exception as e:
-            st.error(f"Error guardando info conductor: {e}"); return False
+        return bool(self._exec("""
+            INSERT INTO conductores_info (conductor, fecha_ingreso, observaciones, fecha_registro)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (conductor) DO UPDATE
+            SET fecha_ingreso = EXCLUDED.fecha_ingreso,
+                observaciones = EXCLUDED.observaciones
+        """, (conductor.strip().upper(), fecha_ingreso, observaciones.strip(), hora_colombia())))
 
     # ---- Vacaciones ----
     def obtener_vacaciones(self, conductor=None):
-        try:
-            c = self.conn()
-            if conductor:
-                df = pd.read_sql_query(
-                    "SELECT * FROM vacaciones WHERE conductor = %s ORDER BY fecha_inicio DESC",
-                    c, params=(conductor,))
-            else:
-                df = pd.read_sql_query("SELECT * FROM vacaciones ORDER BY fecha_inicio DESC", c)
-            c.close(); return df
-        except:
-            return pd.DataFrame()
+        if conductor:
+            return self._query_df(
+                "SELECT * FROM vacaciones WHERE conductor = %s ORDER BY fecha_inicio DESC",
+                (conductor,)
+            )
+        return self._query_df("SELECT * FROM vacaciones ORDER BY fecha_inicio DESC")
 
     def registrar_vacacion(self, data):
+        conn = get_conn()
         try:
-            c = self.conn(); cur = c.cursor()
+            cur = conn.cursor()
             cur.execute("""
-                INSERT INTO vacaciones (conductor, fecha_inicio, fecha_fin, dias, anio_laboral, observaciones, registrado_por, fecha_registro)
+                INSERT INTO vacaciones (conductor, fecha_inicio, fecha_fin, dias, anio_laboral,
+                    observaciones, registrado_por, fecha_registro)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
             """, (
                 data['conductor'], data['fecha_inicio'], data['fecha_fin'],
@@ -670,37 +681,46 @@ class DB:
                 data.get('registrado_por','').strip().upper(), hora_colombia()
             ))
             nuevo_id = cur.fetchone()[0]
-            c.commit(); c.close(); return nuevo_id
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error registrando vacación: {e}"); return None
+            conn.rollback()
+            st.error(f"Error registrando vacación: {e}")
+            return None
+        finally:
+            put_conn(conn)
+
+    def actualizar_vacacion(self, vac_id, data):
+        """Editar un registro de vacación existente."""
+        return bool(self._exec("""
+            UPDATE vacaciones
+            SET fecha_inicio = %s, fecha_fin = %s, dias = %s,
+                anio_laboral = %s, observaciones = %s
+            WHERE id = %s
+        """, (
+            data['fecha_inicio'], data['fecha_fin'],
+            int(data['dias']), data.get('anio_laboral'),
+            data.get('observaciones',''), vac_id
+        )))
 
     def eliminar_vacacion(self, vac_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM vacaciones WHERE id = %s", (vac_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando vacación: {e}")
+        self._exec("DELETE FROM vacaciones WHERE id = %s", (vac_id,))
 
     # ---- Préstamos ----
     def obtener_prestamos(self, conductor=None, estado=None):
-        try:
-            c = self.conn()
-            q = "SELECT * FROM prestamos WHERE 1=1"
-            params = []
-            if conductor:
-                q += " AND conductor = %s"; params.append(conductor)
-            if estado and estado != "Todos":
-                q += " AND estado = %s"; params.append(estado)
-            q += " ORDER BY fecha_prestamo DESC, fecha_registro DESC"
-            df = pd.read_sql_query(q, c, params=params or None)
-            c.close(); return df
-        except Exception as e:
-            st.error(f"Error obteniendo préstamos: {e}"); return pd.DataFrame()
+        q = "SELECT * FROM prestamos WHERE 1=1"
+        params = []
+        if conductor:
+            q += " AND conductor = %s"; params.append(conductor)
+        if estado and estado != "Todos":
+            q += " AND estado = %s"; params.append(estado)
+        q += " ORDER BY fecha_prestamo DESC, fecha_registro DESC"
+        return self._query_df(q, params if params else None)
 
     def registrar_prestamo(self, data):
+        conn = get_conn()
         try:
-            c = self.conn(); cur = c.cursor()
+            cur = conn.cursor()
             cur.execute("""
                 INSERT INTO prestamos (conductor, monto_total, fecha_prestamo, motivo, observaciones, estado, fecha_registro)
                 VALUES (%s, %s, %s, %s, %s, 'activo', %s) RETURNING id
@@ -710,45 +730,37 @@ class DB:
                 data.get('observaciones','').strip(), hora_colombia()
             ))
             nuevo_id = cur.fetchone()[0]
-            c.commit(); c.close(); return nuevo_id
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error registrando préstamo: {e}"); return None
+            conn.rollback()
+            st.error(f"Error registrando préstamo: {e}")
+            return None
+        finally:
+            put_conn(conn)
 
     def eliminar_prestamo(self, prestamo_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM prestamos WHERE id = %s", (prestamo_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando préstamo: {e}")
+        self._exec("DELETE FROM prestamos WHERE id = %s", (prestamo_id,))
 
     def actualizar_estado_prestamo(self, prestamo_id, estado):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("UPDATE prestamos SET estado = %s WHERE id = %s", (estado, prestamo_id))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error actualizando estado: {e}")
+        self._exec("UPDATE prestamos SET estado = %s WHERE id = %s", (estado, prestamo_id))
 
     # ---- Pagos ----
     def obtener_pagos(self, prestamo_id=None):
-        try:
-            c = self.conn()
-            if prestamo_id:
-                df = pd.read_sql_query(
-                    "SELECT * FROM pagos_prestamos WHERE prestamo_id = %s ORDER BY fecha_pago DESC",
-                    c, params=(prestamo_id,))
-            else:
-                df = pd.read_sql_query("SELECT * FROM pagos_prestamos ORDER BY fecha_pago DESC", c)
-            c.close(); return df
-        except:
-            return pd.DataFrame()
+        if prestamo_id:
+            return self._query_df(
+                "SELECT * FROM pagos_prestamos WHERE prestamo_id = %s ORDER BY fecha_pago DESC",
+                (prestamo_id,)
+            )
+        return self._query_df("SELECT * FROM pagos_prestamos ORDER BY fecha_pago DESC")
 
     def registrar_pago(self, data):
+        conn = get_conn()
         try:
-            c = self.conn(); cur = c.cursor()
+            cur = conn.cursor()
             cur.execute("""
-                INSERT INTO pagos_prestamos (prestamo_id, monto_pago, fecha_pago, observaciones, registrado_por, fecha_registro)
+                INSERT INTO pagos_prestamos (prestamo_id, monto_pago, fecha_pago,
+                    observaciones, registrado_por, fecha_registro)
                 VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
             """, (
                 data['prestamo_id'], int(data['monto_pago']),
@@ -756,22 +768,23 @@ class DB:
                 data.get('registrado_por','').strip().upper(), hora_colombia()
             ))
             nuevo_id = cur.fetchone()[0]
-            c.commit(); c.close(); return nuevo_id
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error registrando pago: {e}"); return None
+            conn.rollback()
+            st.error(f"Error registrando pago: {e}")
+            return None
+        finally:
+            put_conn(conn)
 
     def eliminar_pago(self, pago_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM pagos_prestamos WHERE id = %s", (pago_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando pago: {e}")
+        self._exec("DELETE FROM pagos_prestamos WHERE id = %s", (pago_id,))
 
     # ---- Anticipos ----
     def registrar_viaje(self, data):
+        conn = get_conn()
         try:
-            c = self.conn(); cur = c.cursor()
+            cur = conn.cursor()
             cur.execute("""
                 INSERT INTO anticipos_v1
                 (fecha_viaje, fecha_registro, placa, conductor, cliente,
@@ -784,73 +797,55 @@ class DB:
                 data.get('manifiesto','').strip().upper()
             ))
             nuevo_id = cur.fetchone()[0]
-            c.commit(); c.close(); return nuevo_id
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error guardando viaje: {e}"); return None
+            conn.rollback()
+            st.error(f"Error guardando viaje: {e}")
+            return None
+        finally:
+            put_conn(conn)
 
     def editar_viaje(self, viaje_id, data):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("""
-                UPDATE anticipos_v1 SET
-                    fecha_viaje = %s, placa = %s, conductor = %s, cliente = %s,
-                    origen = %s, destino = %s, valor_anticipo = %s,
-                    observaciones = %s, manifiesto = %s
-                WHERE id = %s
-            """, (
-                data['fecha_viaje'], data['placa'], data['conductor'], data['cliente'],
-                data['origen'], data['destino'], int(data['valor_anticipo']),
-                data.get('observaciones',''), data.get('manifiesto','').strip().upper(), viaje_id
-            ))
-            c.commit(); c.close(); return True
-        except Exception as e:
-            st.error(f"Error editando viaje: {e}"); return False
+        return bool(self._exec("""
+            UPDATE anticipos_v1 SET
+                fecha_viaje = %s, placa = %s, conductor = %s, cliente = %s,
+                origen = %s, destino = %s, valor_anticipo = %s,
+                observaciones = %s, manifiesto = %s
+            WHERE id = %s
+        """, (
+            data['fecha_viaje'], data['placa'], data['conductor'], data['cliente'],
+            data['origen'], data['destino'], int(data['valor_anticipo']),
+            data.get('observaciones',''), data.get('manifiesto','').strip().upper(), viaje_id
+        )))
 
     def legalizar(self, viaje_id, nombre_quien_legaliza, obs_legalizacion=""):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("""
-                UPDATE anticipos_v1
-                SET legalizado = TRUE, fecha_legalizacion = %s,
-                    legalizado_por = %s, obs_legalizacion = %s
-                WHERE id = %s
-            """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id))
-            c.commit(); c.close(); return True
-        except Exception as e:
-            st.error(f"Error legalizando: {e}"); return False
+        return bool(self._exec("""
+            UPDATE anticipos_v1
+            SET legalizado = TRUE, fecha_legalizacion = %s,
+                legalizado_por = %s, obs_legalizacion = %s
+            WHERE id = %s
+        """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id)))
 
     def buscar(self, estado=None, fecha_ini=None, fecha_fin=None, placa=None, conductor=None, manifiesto=None):
-        try:
-            c = self.conn()
-            q = "SELECT * FROM anticipos_v1 WHERE 1=1"; params = []
-            if estado == "legalizado":   q += " AND legalizado = TRUE"
-            elif estado == "pendiente":  q += " AND legalizado = FALSE"
-            if fecha_ini: q += " AND fecha_viaje >= %s"; params.append(fecha_ini)
-            if fecha_fin: q += " AND fecha_viaje <= %s"; params.append(fecha_fin)
-            if placa:     q += " AND placa = %s";        params.append(placa)
-            if conductor: q += " AND conductor ILIKE %s"; params.append(f"%{conductor}%")
-            if manifiesto:q += " AND manifiesto ILIKE %s"; params.append(f"%{manifiesto}%")
-            q += " ORDER BY fecha_viaje DESC, fecha_registro DESC"
-            df = pd.read_sql_query(q, c, params=params); c.close(); return df
-        except Exception as e:
-            st.error(f"Error buscando: {e}"); return pd.DataFrame()
+        q = "SELECT * FROM anticipos_v1 WHERE 1=1"
+        params = []
+        if estado == "legalizado":   q += " AND legalizado = TRUE"
+        elif estado == "pendiente":  q += " AND legalizado = FALSE"
+        if fecha_ini: q += " AND fecha_viaje >= %s"; params.append(fecha_ini)
+        if fecha_fin: q += " AND fecha_viaje <= %s"; params.append(fecha_fin)
+        if placa:     q += " AND placa = %s";        params.append(placa)
+        if conductor: q += " AND conductor ILIKE %s"; params.append(f"%{conductor}%")
+        if manifiesto:q += " AND manifiesto ILIKE %s"; params.append(f"%{manifiesto}%")
+        q += " ORDER BY fecha_viaje DESC, fecha_registro DESC"
+        return self._query_df(q, params if params else None)
 
     def eliminar(self, viaje_id):
-        try:
-            c = self.conn(); cur = c.cursor()
-            cur.execute("DELETE FROM anticipos_v1 WHERE id = %s", (viaje_id,))
-            c.commit(); c.close()
-        except Exception as e:
-            st.error(f"Error eliminando: {e}")
+        self._exec("DELETE FROM anticipos_v1 WHERE id = %s", (viaje_id,))
 
     def obtener_por_id(self, viaje_id):
-        try:
-            c = self.conn()
-            df = pd.read_sql_query("SELECT * FROM anticipos_v1 WHERE id = %s", c, params=(viaje_id,))
-            c.close()
-            return df.iloc[0] if not df.empty else None
-        except:
-            return None
+        df = self._query_df("SELECT * FROM anticipos_v1 WHERE id = %s", (viaje_id,))
+        return df.iloc[0] if not df.empty else None
 
 
 # ==================== HELPERS ====================
@@ -878,17 +873,21 @@ def main():
     st.set_page_config(page_title="Anticipos - Transporte de Carga", layout="wide", page_icon="🚛")
     st.title("🚛 Gestión de Anticipos - Transporte de Carga")
 
-    for key, val in [
-        ('db', None), ('confirmar_eliminar', None), ('editando_id', None),
-        ('confirmar_eliminar_cliente', None), ('confirmar_eliminar_conductor', None),
-        ('editando_conductor_id', None), ('confirmar_eliminar_vac', None),
-        ('confirmar_eliminar_prestamo', None), ('confirmar_eliminar_pago', None),
-    ]:
+    session_defaults = {
+        'db': None, 'confirmar_eliminar': None, 'editando_id': None,
+        'confirmar_eliminar_cliente': None, 'confirmar_eliminar_conductor': None,
+        'editando_conductor_id': None, 'confirmar_eliminar_vac': None,
+        'editando_vac_id': None,
+        'confirmar_eliminar_prestamo': None, 'confirmar_eliminar_pago': None,
+    }
+    for key, val in session_defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
     if st.session_state.db is None:
-        st.session_state.db = DB()
+        db = DB()
+        db.init_tablas()
+        st.session_state.db = db
     db = st.session_state.db
 
     (tab_reg, tab_leg, tab_hist,
@@ -1162,14 +1161,10 @@ def main():
                     if cancelar_edit:
                         st.session_state.editando_id = None; st.rerun()
 
-    # ==================== TAB 4: VACACIONES (v11) ====================
+    # ==================== TAB 4: VACACIONES v12 ====================
     with tab_vac:
-        st.header("🏖️ Gestión de Vacaciones de Conductores")
-        st.markdown(
-            "**Lógica:** Cada conductor tiene derecho a vacaciones una vez cumplido cada año laboral "
-            "(a partir de su fecha de ingreso). Si el aniversario pasó y no hay registro de vacaciones "
-            "para ese período → **vacaciones vencidas**."
-        )
+        st.header("🏖️ Vacaciones de Conductores")
+        st.caption(f"Cada año laboral genera derecho a **{DIAS_VACACIONES_ANUALES} días** de vacaciones.")
 
         lista_conductores_vac = get_lista_conductores(db)
         df_info_todos         = db.obtener_todos_info_conductores()
@@ -1180,21 +1175,18 @@ def main():
 
         # ---- RESUMEN GENERAL ----
         with v_tab1:
-            st.subheader("Estado de vacaciones por conductor")
-
             col_f1v, col_f2v = st.columns(2)
             with col_f1v:
-                filtro_cond_vac = st.selectbox("Filtrar por conductor", ["Todos"] + lista_conductores_vac, key="vac_filtro_cond")
+                filtro_cond_vac = st.selectbox("Filtrar conductor", ["Todos"] + lista_conductores_vac, key="vac_filtro_cond")
             with col_f2v:
                 filtro_estado_vac = st.selectbox(
-                    "Filtrar por estado",
-                    ["Todos", "🔴 Con períodos vencidos", "✅ Al día", "⚪ Sin fecha ingreso"],
+                    "Filtrar estado",
+                    ["Todos", "🔴 Con días vencidos", "✅ Al día", "⚪ Sin fecha ingreso"],
                     key="vac_filtro_estado"
                 )
 
             conductores_mostrar = lista_conductores_vac if filtro_cond_vac == "Todos" else [filtro_cond_vac]
 
-            # Construir resumen
             resumen_rows = []
             for cond in conductores_mostrar:
                 info_row = df_info_todos[df_info_todos["conductor"] == cond].iloc[0] \
@@ -1203,88 +1195,74 @@ def main():
                 if info_row is not None and info_row.get("fecha_ingreso") is not None:
                     fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
                     est = calcular_estado_vacaciones(cond, fi, df_vac_todos, hoy)
-                    if est["periodos_vencidos"] > 0:
-                        estado_v = "vencidas"
-                    elif est["periodos_cumplidos"] > 0:
-                        estado_v = "al_dia"
-                    else:
-                        estado_v = "sin_periodos"  # menos de 1 año
+                    estado_v = "vencidas" if est["periodos_vencidos"] > 0 \
+                        else ("al_dia" if est["periodos_cumplidos"] > 0 else "sin_periodos")
                     resumen_rows.append({
-                        "conductor": cond,
-                        "fecha_ingreso": str(fi),
+                        "conductor": cond, "fecha_ingreso": str(fi),
                         "periodos_cumplidos": est["periodos_cumplidos"],
                         "periodos_tomados": est["periodos_tomados"],
                         "periodos_vencidos": est["periodos_vencidos"],
-                        "dias_vencido_max": est["dias_vencido_max"],
-                        "prox_aniv": str(est["prox_aniv"]),
+                        "dias_vencidos_total": est["dias_vencidos_total"],
+                        "dias_desde_vencimiento": est["dias_desde_vencimiento"],
+                        "prox_vac": str(est["prox_vac"]),
                         "dias_prox": est["dias_prox"],
                         "estado_v": estado_v,
-                        "est_obj": est,
-                        "fi_date": fi,
+                        "est_obj": est, "fi_date": fi,
                     })
                 else:
                     resumen_rows.append({
-                        "conductor": cond,
-                        "fecha_ingreso": "—",
-                        "periodos_cumplidos": None,
-                        "periodos_vencidos": None,
-                        "periodos_tomados": None,
-                        "dias_vencido_max": None,
-                        "prox_aniv": "—",
-                        "dias_prox": None,
-                        "estado_v": "sin_fecha",
-                        "est_obj": None,
-                        "fi_date": None,
+                        "conductor": cond, "fecha_ingreso": "—",
+                        "periodos_cumplidos": None, "periodos_vencidos": None,
+                        "periodos_tomados": None, "dias_vencidos_total": None,
+                        "dias_desde_vencimiento": None,
+                        "prox_vac": "—", "dias_prox": None,
+                        "estado_v": "sin_fecha", "est_obj": None, "fi_date": None,
                     })
 
             df_resumen = pd.DataFrame(resumen_rows)
-
-            # Aplicar filtro de estado
-            if filtro_estado_vac == "🔴 Con períodos vencidos":
+            if filtro_estado_vac == "🔴 Con días vencidos":
                 df_resumen = df_resumen[df_resumen["estado_v"] == "vencidas"]
             elif filtro_estado_vac == "✅ Al día":
-                df_resumen = df_resumen[df_resumen["estado_v"].isin(["al_dia", "sin_periodos"])]
+                df_resumen = df_resumen[df_resumen["estado_v"].isin(["al_dia","sin_periodos"])]
             elif filtro_estado_vac == "⚪ Sin fecha ingreso":
                 df_resumen = df_resumen[df_resumen["estado_v"] == "sin_fecha"]
 
-            # Métricas rápidas
+            # Métricas
             col_mv1, col_mv2, col_mv3, col_mv4 = st.columns(4)
-            total_cond_v   = len(df_resumen)
-            con_vencidas   = (df_resumen["estado_v"] == "vencidas").sum()
-            al_dia_v       = df_resumen["estado_v"].isin(["al_dia", "sin_periodos"]).sum()
-            sin_fecha_v    = (df_resumen["estado_v"] == "sin_fecha").sum()
-            col_mv1.metric("Total conductores",   total_cond_v)
-            col_mv2.metric("🔴 Períodos vencidos", int(df_resumen["periodos_vencidos"].fillna(0).sum()))
-            col_mv3.metric("✅ Al día",            al_dia_v)
-            col_mv4.metric("⚪ Sin fecha ingreso", sin_fecha_v)
+            col_mv1.metric("Conductores",          len(df_resumen))
+            col_mv2.metric("🔴 Días vencidos",     int(df_resumen["dias_vencidos_total"].fillna(0).sum()))
+            col_mv3.metric("✅ Al día",             df_resumen["estado_v"].isin(["al_dia","sin_periodos"]).sum())
+            col_mv4.metric("⚪ Sin fecha ingreso",  (df_resumen["estado_v"] == "sin_fecha").sum())
 
-            if con_vencidas > 0:
-                conductores_venc = df_resumen[df_resumen["estado_v"] == "vencidas"]["conductor"].tolist()
-                st.error(
-                    f"🚨 **{con_vencidas} conductor(es)** tienen vacaciones vencidas: "
-                    + ", ".join(conductores_venc)
-                )
+            venc_list = df_resumen[df_resumen["estado_v"] == "vencidas"]["conductor"].tolist()
+            if venc_list:
+                st.error(f"🚨 **{len(venc_list)} conductor(es) con vacaciones vencidas:** " + ", ".join(venc_list))
 
             st.divider()
 
             # Tarjetas por conductor
             for _, r in df_resumen.iterrows():
-                cond = r["conductor"]
+                cond     = r["conductor"]
                 estado_v = r["estado_v"]
 
                 if estado_v == "vencidas":
-                    icono = "🔴"
-                    n_venc = int(r["periodos_vencidos"])
-                    dias_v = int(r["dias_vencido_max"])
-                    label_v = (f"🔴 {cond}  |  {n_venc} período(s) VENCIDO(S)  |  "
-                               f"Hace {dias_v} días desde el último aniversario sin tomar  |  "
-                               f"Próx. aniversario: {r['prox_aniv']}")
+                    n_venc     = int(r["periodos_vencidos"])
+                    dias_v_tot = int(r["dias_vencidos_total"])
+                    dias_desde = int(r["dias_desde_vencimiento"])
+                    label_v = (
+                        f"🔴 {cond}  |  {n_venc} período(s) vencido(s) = {dias_v_tot} días  |  "
+                        f"Hace {dias_desde} días sin tomar  |  Próx. vacación: {r['prox_vac']}"
+                    )
                 elif estado_v == "al_dia":
-                    label_v = (f"✅ {cond}  |  {r['periodos_cumplidos']} período(s) cumplido(s), todos tomados  |  "
-                               f"Próx. aniversario: {r['prox_aniv']} (en {r['dias_prox']} días)")
+                    label_v = (
+                        f"✅ {cond}  |  {r['periodos_cumplidos']} período(s) tomados  |  "
+                        f"Próx. vacación: {r['prox_vac']} (en {r['dias_prox']} días)"
+                    )
                 elif estado_v == "sin_periodos":
-                    label_v = (f"🟢 {cond}  |  Menos de 1 año trabajado — aún no cumple el primer período  |  "
-                               f"Primer aniversario: {r['prox_aniv']} (en {r['dias_prox']} días)")
+                    label_v = (
+                        f"🟢 {cond}  |  Menos de 1 año trabajado  |  "
+                        f"Primera vacación: {r['prox_vac']} (en {r['dias_prox']} días)"
+                    )
                 else:
                     label_v = f"⚪ {cond}  |  Sin fecha de ingreso registrada"
 
@@ -1295,83 +1273,132 @@ def main():
 
                     col_va, col_vb = st.columns([2, 2])
                     with col_va:
-                        fi_d = r["fi_date"]
-                        st.write(f"📅 Fecha de ingreso: **{r['fecha_ingreso']}**")
-                        st.write(f"📆 Próximo aniversario: **{r['prox_aniv']}** (en {r['dias_prox']} días)")
+                        st.write(f"📅 **Ingreso:** {r['fecha_ingreso']}")
 
                         est_obj = r["est_obj"]
                         if est_obj:
+                            # Alerta de días vencidos
+                            if est_obj["periodos_vencidos"] > 0:
+                                st.error(
+                                    f"⏰ **{est_obj['dias_vencidos_total']} días de vacaciones vencidos** "
+                                    f"({est_obj['periodos_vencidos']} período(s) × {DIAS_VACACIONES_ANUALES} días)"
+                                )
+
+                            # Próxima vacación
+                            if est_obj["dias_prox"] <= 30:
+                                st.warning(f"📆 Próxima vacación: **{r['prox_vac']}** (¡en {est_obj['dias_prox']} días!)")
+                            else:
+                                st.info(f"📆 Próxima vacación: **{r['prox_vac']}** (en {est_obj['dias_prox']} días)")
+
+                            # Línea de tiempo de períodos
                             st.markdown("**Períodos anuales:**")
                             for p in est_obj["periodos_estado"]:
                                 if p["tomado"]:
                                     reg = p["registros"][0] if p["registros"] else {}
                                     st.success(
-                                        f"✅ **{p['label']}** — Tomadas: "
+                                        f"✅ **{p['label']}** — "
                                         f"{str(reg.get('fecha_inicio',''))[:10]} → {str(reg.get('fecha_fin',''))[:10]} "
                                         f"({reg.get('dias','?')} días)"
                                     )
                                 else:
-                                    dias_desde = (hoy - p["fin"]).days
+                                    dias_d = (hoy - p["fin"]).days
                                     st.error(
-                                        f"🔴 **{p['label']}** — **NO TOMADAS** "
-                                        f"(vencidas hace **{dias_desde} días**)"
+                                        f"🔴 **{p['label']}** — NO TOMADAS "
+                                        f"(vencidas hace **{dias_d} días** · {DIAS_VACACIONES_ANUALES} días perdidos)"
                                     )
 
                             if est_obj["periodos_cumplidos"] == 0:
-                                st.info(f"⏳ Aún no ha cumplido el primer año laboral. Primer aniversario: **{r['prox_aniv']}**")
+                                st.info(f"⏳ Aún no cumple el primer año. Primera vacación: **{r['prox_vac']}**")
 
                     with col_vb:
-                        st.markdown("**Historial de vacaciones registradas:**")
+                        st.markdown("**Registros de vacaciones:**")
                         df_vac_cond = df_vac_todos[df_vac_todos["conductor"] == cond] \
                             if not df_vac_todos.empty else pd.DataFrame()
+
                         if df_vac_cond.empty:
                             st.info("No hay vacaciones registradas.")
                         else:
                             for _, vrow in df_vac_cond.sort_values("fecha_inicio", ascending=False).iterrows():
                                 anio_lbl = f"Año {int(vrow['anio_laboral'])}" if pd.notna(vrow.get('anio_laboral')) else "Año ?"
-                                cols_vac = st.columns([4, 1])
-                                with cols_vac[0]:
-                                    st.write(
-                                        f"📆 **{anio_lbl}** | {str(vrow['fecha_inicio'])[:10]} → {str(vrow['fecha_fin'])[:10]} "
-                                        f"| **{vrow['dias']} días** | {vrow.get('observaciones','') or '—'}"
-                                    )
-                                with cols_vac[1]:
-                                    if st.session_state.confirmar_eliminar_vac == vrow['id']:
-                                        st.warning("¿Eliminar?")
-                                        c_s, c_n = st.columns(2)
-                                        with c_s:
-                                            if st.button("Sí", key=f"si_vac_{vrow['id']}"):
-                                                db.eliminar_vacacion(vrow['id'])
-                                                st.session_state.confirmar_eliminar_vac = None
-                                                st.rerun()
-                                        with c_n:
-                                            if st.button("No", key=f"no_vac_{vrow['id']}"):
-                                                st.session_state.confirmar_eliminar_vac = None; st.rerun()
-                                    else:
-                                        if st.button("🗑️", key=f"del_vac_{vrow['id']}"):
-                                            st.session_state.confirmar_eliminar_vac = vrow['id']; st.rerun()
+                                vid = vrow['id']
+
+                                # Modo edición
+                                if st.session_state.editando_vac_id == vid:
+                                    with st.form(f"form_edit_vac_{vid}"):
+                                        st.markdown(f"**Editando vacación ID {vid}**")
+                                        col_ev1, col_ev2 = st.columns(2)
+                                        with col_ev1:
+                                            fi_edit = st.date_input("Fecha inicio",
+                                                value=pd.to_datetime(vrow['fecha_inicio']).date(),
+                                                key=f"fi_edit_{vid}")
+                                            ff_edit = st.date_input("Fecha fin",
+                                                value=pd.to_datetime(vrow['fecha_fin']).date(),
+                                                key=f"ff_edit_{vid}")
+                                        with col_ev2:
+                                            dias_edit = st.number_input("Días", min_value=1, max_value=60,
+                                                value=int(vrow['dias']), key=f"d_edit_{vid}")
+                                            obs_edit = st.text_area("Observaciones",
+                                                value=vrow.get('observaciones','') or '',
+                                                height=60, key=f"obs_edit_{vid}")
+                                        col_ge, col_ce = st.columns(2)
+                                        with col_ge:
+                                            guardar_vac = st.form_submit_button("💾 Guardar", type="primary")
+                                        with col_ce:
+                                            cancelar_vac = st.form_submit_button("✖ Cancelar")
+                                        if guardar_vac:
+                                            ok_ev = db.actualizar_vacacion(vid, {
+                                                'fecha_inicio': fi_edit, 'fecha_fin': ff_edit,
+                                                'dias': dias_edit,
+                                                'anio_laboral': vrow.get('anio_laboral'),
+                                                'observaciones': obs_edit.strip()
+                                            })
+                                            if ok_ev:
+                                                st.session_state.editando_vac_id = None
+                                                st.success("✅ Actualizado."); st.rerun()
+                                        if cancelar_vac:
+                                            st.session_state.editando_vac_id = None; st.rerun()
+                                else:
+                                    col_vr, col_ve, col_vd = st.columns([5, 1, 1])
+                                    with col_vr:
+                                        st.write(
+                                            f"📆 **{anio_lbl}** | "
+                                            f"{str(vrow['fecha_inicio'])[:10]} → {str(vrow['fecha_fin'])[:10]} "
+                                            f"| **{vrow['dias']} días** | {vrow.get('observaciones','') or '—'}"
+                                        )
+                                    with col_ve:
+                                        if st.button("✏️", key=f"edit_vac_{vid}", help="Editar"):
+                                            st.session_state.editando_vac_id = vid; st.rerun()
+                                    with col_vd:
+                                        if st.session_state.confirmar_eliminar_vac == vid:
+                                            c_s, c_n = st.columns(2)
+                                            with c_s:
+                                                if st.button("Sí", key=f"si_vac_{vid}"):
+                                                    db.eliminar_vacacion(vid)
+                                                    st.session_state.confirmar_eliminar_vac = None; st.rerun()
+                                            with c_n:
+                                                if st.button("No", key=f"no_vac_{vid}"):
+                                                    st.session_state.confirmar_eliminar_vac = None; st.rerun()
+                                        else:
+                                            if st.button("🗑️", key=f"del_vac_{vid}", help="Eliminar"):
+                                                st.session_state.confirmar_eliminar_vac = vid; st.rerun()
 
             st.divider()
-            col_exp_v1, col_exp_v2 = st.columns([3, 1])
-            with col_exp_v2:
-                excel_vac = generar_excel_vacaciones_v11(df_info_todos, df_vac_todos, lista_conductores_vac)
-                st.download_button(
-                    label="📥 Exportar vacaciones a Excel", data=excel_vac,
-                    file_name=f"vacaciones_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
+            excel_vac = generar_excel_vacaciones(df_info_todos, df_vac_todos, lista_conductores_vac)
+            st.download_button(
+                label="📥 Exportar vacaciones a Excel", data=excel_vac,
+                file_name=f"vacaciones_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
 
         # ---- REGISTRAR VACACIÓN ----
         with v_tab2:
             st.subheader("Registrar período de vacaciones tomado")
-            st.markdown("Selecciona el conductor y el **año laboral** al que corresponden estas vacaciones.")
 
             col_sel_cond, _ = st.columns([2, 2])
             with col_sel_cond:
                 cond_vac_sel = st.selectbox("Conductor", lista_conductores_vac, key="vac_cond_sel_preview")
 
-            # Mostrar períodos pendientes del conductor seleccionado
             info_cond_sel = df_info_todos[df_info_todos["conductor"] == cond_vac_sel].iloc[0] \
                 if not df_info_todos.empty and (df_info_todos["conductor"] == cond_vac_sel).any() else None
 
@@ -1381,39 +1408,37 @@ def main():
                 est_sel = calcular_estado_vacaciones(cond_vac_sel, fi_sel, df_vac_todos, hoy)
 
                 if est_sel["periodos_cumplidos"] == 0:
-                    st.info(f"⏳ **{cond_vac_sel}** aún no ha cumplido su primer año laboral. "
-                            f"Primer aniversario: **{est_sel['prox_aniv']}**")
+                    st.info(
+                        f"⏳ **{cond_vac_sel}** aún no ha cumplido su primer año laboral. "
+                        f"Primera vacación: **{est_sel['prox_vac']}** (en {est_sel['dias_prox']} días)"
+                    )
                 else:
                     pendientes_cond = [p for p in est_sel["periodos_estado"] if not p["tomado"]]
-                    tomados_cond    = [p for p in est_sel["periodos_estado"] if p["tomado"]]
-
                     if pendientes_cond:
+                        dias_pend = len(pendientes_cond) * DIAS_VACACIONES_ANUALES
                         st.warning(
-                            f"⚠️ **{cond_vac_sel}** tiene **{len(pendientes_cond)} período(s) pendiente(s)**: "
+                            f"⚠️ **{cond_vac_sel}** tiene **{len(pendientes_cond)} período(s) pendiente(s)** "
+                            f"= **{dias_pend} días** sin tomar: "
                             + ", ".join(p["label"] for p in pendientes_cond)
                         )
                     else:
                         st.success(f"✅ **{cond_vac_sel}** tiene todos sus períodos al día.")
-
                     periodos_disponibles = est_sel["periodos_estado"]
             else:
-                st.warning(f"⚠️ **{cond_vac_sel}** no tiene fecha de ingreso registrada. "
-                           "Regístrala en la pestaña **⚙️ Fecha de ingreso** primero.")
-
-            st.divider()
+                st.warning(f"⚠️ **{cond_vac_sel}** no tiene fecha de ingreso. "
+                           "Regístrala en **⚙️ Fecha de ingreso**.")
 
             if periodos_disponibles:
                 opciones_periodos = {
                     p["label"] + (" ✅ (ya tomadas)" if p["tomado"] else " 🔴 (pendiente)"): p["anio_laboral"]
                     for p in periodos_disponibles
                 }
-                with st.form("form_vacacion_v11", clear_on_submit=True):
+                with st.form("form_vacacion_v12", clear_on_submit=True):
                     col1v, col2v = st.columns(2)
                     with col1v:
                         periodo_sel_label = st.selectbox(
-                            "Período anual al que corresponde esta vacación",
-                            list(opciones_periodos.keys()),
-                            key="vac_periodo_sel"
+                            "Período al que corresponde esta vacación",
+                            list(opciones_periodos.keys())
                         )
                         anio_laboral_sel = opciones_periodos[periodo_sel_label]
                         fi_vac  = st.date_input("Fecha inicio vacaciones", value=datetime.today())
@@ -1434,17 +1459,15 @@ def main():
                         else:
                             nuevo_id_v = db.registrar_vacacion({
                                 'conductor': cond_vac_sel,
-                                'fecha_inicio': fi_vac,
-                                'fecha_fin': ff_vac,
-                                'dias': dias_vac,
-                                'anio_laboral': anio_laboral_sel,
+                                'fecha_inicio': fi_vac, 'fecha_fin': ff_vac,
+                                'dias': dias_vac, 'anio_laboral': anio_laboral_sel,
                                 'observaciones': obs_vac.strip(),
                                 'registrado_por': reg_por_v.strip()
                             })
                             if nuevo_id_v:
                                 st.success(
-                                    f"✅ Vacaciones registradas para **{cond_vac_sel}** "
-                                    f"(Año laboral {anio_laboral_sel}): "
+                                    f"✅ Vacaciones registradas — **{cond_vac_sel}** "
+                                    f"Año laboral {anio_laboral_sel}: "
                                     f"{fi_vac} → {ff_vac} ({dias_vac} días)"
                                 )
                                 st.rerun()
@@ -1452,7 +1475,6 @@ def main():
         # ---- FECHA DE INGRESO ----
         with v_tab3:
             st.subheader("⚙️ Registrar / editar fecha de ingreso")
-            st.markdown("La fecha de ingreso es el punto de partida para calcular los períodos anuales.")
 
             with st.form("form_fecha_ingreso", clear_on_submit=True):
                 col1fi, col2fi = st.columns(2)
@@ -1462,8 +1484,7 @@ def main():
                 with col2fi:
                     obs_fi = st.text_area("Observaciones", height=80)
 
-                btn_fi = st.form_submit_button("💾 Guardar fecha de ingreso", type="primary")
-                if btn_fi:
+                if st.form_submit_button("💾 Guardar fecha de ingreso", type="primary"):
                     ok_fi = db.guardar_info_conductor(cond_fi, fecha_ing, obs_fi)
                     if ok_fi:
                         st.success(f"✅ Fecha de ingreso de **{cond_fi}** actualizada a **{fecha_ing}**")
@@ -1479,9 +1500,12 @@ def main():
                     fi_d = pd.to_datetime(irow['fecha_ingreso']).date()
                     anios_t = round((hoy - fi_d).days / 365.25, 1)
                     periodos_c = len(calcular_periodos_anuales(fi_d, hoy))
+                    prox = calcular_proxima_vacacion(fi_d, hoy)
+                    dias_p = (prox - hoy).days
                     st.write(
                         f"👤 **{irow['conductor']}** — Ingreso: **{irow['fecha_ingreso']}** — "
-                        f"Antigüedad: {anios_t} años — Períodos cumplidos: **{periodos_c}**"
+                        f"Antigüedad: {anios_t} años — Períodos cumplidos: **{periodos_c}** — "
+                        f"Próxima vacación: **{prox}** (en {dias_p} días)"
                         + (f"  |  {irow['observaciones']}" if irow.get('observaciones') else "")
                     )
 
@@ -1590,7 +1614,7 @@ def main():
                                                 st.session_state.confirmar_eliminar_pago = pg['id']; st.rerun()
 
                 st.divider()
-                col_exp_p1, col_exp_p2 = st.columns([3, 1])
+                _, col_exp_p2 = st.columns([3, 1])
                 with col_exp_p2:
                     df_pagos_export = db.obtener_pagos()
                     excel_p = generar_excel_prestamos(df_prestamos_all, df_pagos_export)

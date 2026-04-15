@@ -83,23 +83,6 @@ def badge_alerta(dias, nivel):
 # ==================== LÓGICA VACACIONES v14 ====================
 
 def calcular_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.DataFrame, hoy: date) -> dict:
-    """
-    Calcula todo el estado vacacional de un conductor.
-
-    Regla: por cada año laboral COMPLETADO se generan 15 días de vacaciones.
-    Los días tomados se restan del total acumulado.
-
-    Retorna dict con:
-      - anios_completos: años laborales completados
-      - dias_generados: anios_completos × 15
-      - dias_usados: suma de días registrados como tomados
-      - dias_disponibles: dias_generados - dias_usados
-      - dias_vencidos: días disponibles sin tomar (> 0 significa que hay días pendientes)
-      - fecha_ultimo_anio: fecha en que termina el año laboral más reciente completado
-      - proxima_fecha: fecha en que se completará el siguiente año laboral
-      - dias_para_proxima: días que faltan para la próxima fecha
-      - periodos: lista de todos los períodos anuales con estado
-    """
     anios_completos = 0
     periodos = []
 
@@ -374,7 +357,6 @@ def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, df_pag
             fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
             calc = calcular_vacaciones(cond, fi, df_vac, hoy)
 
-            # Verificar si todos los períodos pendientes están pagados en dinero
             pagos_cond = df_pagos_vac[df_pagos_vac["conductor"] == cond] if not df_pagos_vac.empty else pd.DataFrame()
             anios_pagados = set(pagos_cond["anio_laboral"].tolist()) if not pagos_cond.empty else set()
             periodos_pendientes_sin_pago = sum(
@@ -424,7 +406,6 @@ def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, df_pag
         ws.column_dimensions[get_column_letter(ci)].width = aw
     ws.freeze_panes = f"A{rh+1}"
 
-    # Hoja 2: registros de vacaciones tomadas
     ws2 = wb.create_sheet("Historial tomadas")
     ws2.merge_cells("A1:G1")
     ws2["A1"] = "Historial de vacaciones tomadas por conductor"
@@ -459,7 +440,6 @@ def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, df_pag
         ws2.column_dimensions[get_column_letter(ci)].width = aw
     ws2.freeze_panes = "A4"
 
-    # Hoja 3: pagos en dinero por período
     ws3 = wb.create_sheet("Pagos en dinero")
     ws3.merge_cells("A1:H1")
     ws3["A1"] = "Pagos de vacaciones en dinero por período anual"
@@ -635,7 +615,6 @@ class DB:
                     fecha_registro TIMESTAMP NOT NULL
                 )
             """)
-            # ── NUEVA TABLA v14: pagos de vacaciones en dinero por período ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS vacaciones_pagos (
                     id SERIAL PRIMARY KEY,
@@ -762,7 +741,6 @@ class DB:
         return self._query_df("SELECT * FROM vacaciones_pagos ORDER BY conductor, anio_laboral")
 
     def registrar_pago_vacacion(self, data):
-        """Inserta o actualiza el pago de vacaciones para un período (conductor + anio_laboral)."""
         conn = get_conn()
         try:
             cur = conn.cursor()
@@ -975,8 +953,7 @@ def main():
         'editando_conductor_id': None, 'confirmar_eliminar_vac': None,
         'editando_vac_id': None,
         'confirmar_eliminar_prestamo': None, 'confirmar_eliminar_pago': None,
-        # v14: control de formulario de pago vacaciones por período
-        'pago_vac_periodo': None,   # (conductor, anio_laboral) activo en el form
+        'pago_vac_periodo': None,
         'confirmar_eliminar_pago_vac': None,
     }
     for key, val in session_defaults.items():
@@ -1268,7 +1245,7 @@ def main():
         lista_conductores_vac = get_lista_conductores(db)
         df_info_todos         = db.obtener_todos_info_conductores()
         df_vac_todos          = db.obtener_vacaciones()
-        df_pagos_vac_todos    = db.obtener_pagos_vacaciones()   # ← v14
+        df_pagos_vac_todos    = db.obtener_pagos_vacaciones()
         hoy                   = hora_colombia().date()
 
         v_tab1, v_tab2, v_tab3 = st.tabs([
@@ -1296,7 +1273,6 @@ def main():
 
             conductores_mostrar = lista_conductores_vac if filtro_cond_vac == "Todos" else [filtro_cond_vac]
 
-            # Calcular resumen
             filas = []
             for cond in conductores_mostrar:
                 info_row = df_info_todos[df_info_todos["conductor"] == cond].iloc[0] \
@@ -1306,13 +1282,11 @@ def main():
                     fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
                     calc = calcular_vacaciones(cond, fi, df_vac_todos, hoy)
 
-                    # Años pagados en dinero para este conductor
                     pagos_cond_df = df_pagos_vac_todos[df_pagos_vac_todos["conductor"] == cond] \
                         if not df_pagos_vac_todos.empty else pd.DataFrame()
                     anios_pagados_dinero = set(pagos_cond_df["anio_laboral"].tolist()) \
                         if not pagos_cond_df.empty else set()
 
-                    # Período pendiente = tiene días sin tomar Y no está pagado en dinero
                     hay_pendiente_real = any(
                         p["anio"] not in anios_pagados_dinero and (
                             DIAS_VACACIONES_ANUALES - sum(
@@ -1351,7 +1325,6 @@ def main():
                         "pagos_cond_df": pd.DataFrame(),
                     })
 
-            # Filtro de estado
             if filtro_estado_vac == "🔴 Con días pendientes":
                 filas = [f for f in filas if f["estado_v"] == "pendientes"]
             elif filtro_estado_vac == "✅ Al día / Sin períodos":
@@ -1359,7 +1332,6 @@ def main():
             elif filtro_estado_vac == "⚪ Sin fecha ingreso":
                 filas = [f for f in filas if f["estado_v"] == "sin_fecha"]
 
-            # Métricas globales
             con_pendientes = sum(1 for f in filas if f["estado_v"] == "pendientes")
             al_dia_count   = sum(1 for f in filas if f["estado_v"] in ("al_dia", "sin_periodos"))
             sin_fecha_c    = sum(1 for f in filas if f["estado_v"] == "sin_fecha")
@@ -1380,7 +1352,6 @@ def main():
 
             st.divider()
 
-            # Tarjetas por conductor
             for fila in filas:
                 cond              = fila["conductor"]
                 calc              = fila["calc"]
@@ -1458,7 +1429,6 @@ def main():
                             for p in calc["periodos"]:
                                 anio_num = p["anio"]
 
-                                # Días tomados en este período
                                 regs_periodo = [
                                     r for r in calc["registros"]
                                     if r.get("fecha_inicio") is not None and (
@@ -1469,7 +1439,6 @@ def main():
                                 dias_tomados  = sum(int(r.get("dias", 0)) for r in regs_periodo)
                                 dias_pend_p   = DIAS_VACACIONES_ANUALES - dias_tomados
 
-                                # Pago en dinero registrado para este período
                                 pago_row = pagos_cond_df[pagos_cond_df["anio_laboral"] == anio_num] \
                                     if not pagos_cond_df.empty else pd.DataFrame()
                                 pagado_en_dinero = not pago_row.empty
@@ -1478,71 +1447,58 @@ def main():
                                 reg_por_din      = pago_row.iloc[0].get("registrado_por","") if pagado_en_dinero else ""
                                 pago_vac_id      = int(pago_row.iloc[0]["id"]) if pagado_en_dinero else None
 
-                                # ── Renderizar período ──
                                 if dias_pend_p <= 0:
-                                    # Todos los días tomados físicamente
                                     st.success(
                                         f"✅ **{p['label']}** — "
                                         f"{dias_tomados} días tomados físicamente"
                                     )
 
                                 elif pagado_en_dinero:
-                                    # Tiene días pendientes PERO están pagados en dinero
-                                    col_per, col_del_pago = st.columns([9, 1])
-                                    with col_per:
-                                        st.info(
-                                            f"💵 **{p['label']}** — "
-                                            f"{dias_tomados} días tomados · "
-                                            f"**{dias_pend_p} días pagados en dinero** · "
-                                            f"${fmt(monto_pago_din)} COP · "
-                                            f"Pagado: {fecha_pago_din}"
-                                            + (f" por {reg_por_din}" if reg_por_din else "")
-                                        )
-                                    with col_del_pago:
-                                        # Botón para eliminar el pago (revertir)
-                                        if st.session_state.confirmar_eliminar_pago_vac == pago_vac_id:
-                                            c_s_pv, c_n_pv = st.columns(2)
-                                            with c_s_pv:
-                                                if st.button("Sí", key=f"si_pvac_{pago_vac_id}"):
-                                                    db.eliminar_pago_vacacion(pago_vac_id)
-                                                    st.session_state.confirmar_eliminar_pago_vac = None
-                                                    st.rerun()
-                                            with c_n_pv:
-                                                if st.button("No", key=f"no_pvac_{pago_vac_id}"):
-                                                    st.session_state.confirmar_eliminar_pago_vac = None
-                                                    st.rerun()
-                                        else:
-                                            if st.button(
-                                                "🗑️", key=f"del_pvac_{cond}_{anio_num}",
-                                                help="Eliminar pago en dinero (revertir a pendiente)"
-                                            ):
-                                                st.session_state.confirmar_eliminar_pago_vac = pago_vac_id
+                                    # ── FIX: botones Sí/No fuera de columnas estrechas ──
+                                    st.info(
+                                        f"💵 **{p['label']}** — "
+                                        f"{dias_tomados} días tomados · "
+                                        f"**{dias_pend_p} días pagados en dinero** · "
+                                        f"${fmt(monto_pago_din)} COP · "
+                                        f"Pagado: {fecha_pago_din}"
+                                        + (f" por {reg_por_din}" if reg_por_din else "")
+                                    )
+                                    if st.session_state.confirmar_eliminar_pago_vac == pago_vac_id:
+                                        st.warning(f"¿Eliminar el pago de **{p['label']}**? Esta acción lo marcará como pendiente nuevamente.")
+                                        col_si_pv, col_no_pv, _ = st.columns([1, 1, 4])
+                                        with col_si_pv:
+                                            if st.button("✅ Sí", key=f"si_pvac_{pago_vac_id}", type="primary"):
+                                                db.eliminar_pago_vacacion(pago_vac_id)
+                                                st.session_state.confirmar_eliminar_pago_vac = None
                                                 st.rerun()
+                                        with col_no_pv:
+                                            if st.button("❌ No", key=f"no_pvac_{pago_vac_id}"):
+                                                st.session_state.confirmar_eliminar_pago_vac = None
+                                                st.rerun()
+                                    else:
+                                        if st.button(
+                                            "🗑️ Eliminar pago", key=f"del_pvac_{cond}_{anio_num}",
+                                            help="Eliminar pago en dinero (revertir a pendiente)"
+                                        ):
+                                            st.session_state.confirmar_eliminar_pago_vac = pago_vac_id
+                                            st.rerun()
 
                                 else:
-                                    # Pendiente sin pago → mostrar formulario para registrar pago
-                                    col_per2, col_btn_pago = st.columns([7, 3])
-                                    with col_per2:
-                                        st.error(
-                                            f"🔴 **{p['label']}** — "
-                                            f"{dias_tomados} días tomados · "
-                                            f"**{dias_pend_p} días pendientes**"
-                                        )
-                                    with col_btn_pago:
-                                        clave_form = (cond, anio_num)
-                                        if st.session_state.pago_vac_periodo == clave_form:
-                                            # Formulario inline para registrar el pago
-                                            pass  # se renderiza abajo
-                                        else:
-                                            if st.button(
-                                                "💵 Registrar pago",
-                                                key=f"btn_pago_vac_{cond}_{anio_num}",
-                                                type="primary"
-                                            ):
-                                                st.session_state.pago_vac_periodo = clave_form
-                                                st.rerun()
+                                    st.error(
+                                        f"🔴 **{p['label']}** — "
+                                        f"{dias_tomados} días tomados · "
+                                        f"**{dias_pend_p} días pendientes**"
+                                    )
+                                    clave_form = (cond, anio_num)
+                                    if st.session_state.pago_vac_periodo != clave_form:
+                                        if st.button(
+                                            "💵 Registrar pago en dinero",
+                                            key=f"btn_pago_vac_{cond}_{anio_num}",
+                                            type="primary"
+                                        ):
+                                            st.session_state.pago_vac_periodo = clave_form
+                                            st.rerun()
 
-                                    # Formulario debajo del período si está activo
                                     if st.session_state.pago_vac_periodo == (cond, anio_num):
                                         with st.form(f"form_pago_vac_{cond}_{anio_num}"):
                                             st.markdown(
@@ -1641,7 +1597,8 @@ def main():
                                         with col_ev2:
                                             dias_edit = st.number_input(
                                                 "Días", min_value=1, max_value=60,
-                                                value=int(vrow['dias']), key=f"d_edit_{vid}"
+                                                value=min(int(vrow['dias']), 60),
+                                                key=f"d_edit_{vid}"
                                             )
                                             obs_edit = st.text_area(
                                                 "Observaciones",
@@ -1670,35 +1627,39 @@ def main():
                                             st.rerun()
 
                                 else:
-                                    col_vr, col_ve, col_vd = st.columns([5, 1, 1])
-                                    with col_vr:
-                                        fi_str = str(vrow['fecha_inicio'])[:10]
-                                        ff_str = str(vrow['fecha_fin'])[:10]
-                                        obs_str = vrow.get('observaciones','') or '—'
-                                        st.write(
-                                            f"📆 {fi_str} → {ff_str}  |  "
-                                            f"**{vrow['dias']} días**  |  {obs_str}"
-                                        )
+                                    fi_str  = str(vrow['fecha_inicio'])[:10]
+                                    ff_str  = str(vrow['fecha_fin'])[:10]
+                                    obs_str = vrow.get('observaciones','') or '—'
+                                    st.write(
+                                        f"📆 {fi_str} → {ff_str}  |  "
+                                        f"**{vrow['dias']} días**  |  {obs_str}"
+                                    )
+
+                                    # ── FIX: botones de acción en una sola fila limpia ──
+                                    col_ve, col_vd = st.columns([1, 1])
                                     with col_ve:
-                                        if st.button("✏️", key=f"edit_vac_{vid}", help="Editar"):
+                                        if st.button("✏️ Editar", key=f"edit_vac_{vid}"):
                                             st.session_state.editando_vac_id = vid
                                             st.rerun()
                                     with col_vd:
                                         if st.session_state.confirmar_eliminar_vac == vid:
-                                            c_s, c_n = st.columns(2)
-                                            with c_s:
-                                                if st.button("Sí", key=f"si_vac_{vid}"):
+                                            st.warning("¿Confirmar eliminación?")
+                                            col_si_v, col_no_v = st.columns(2)
+                                            with col_si_v:
+                                                if st.button("✅ Sí", key=f"si_vac_{vid}", type="primary"):
                                                     db.eliminar_vacacion(vid)
                                                     st.session_state.confirmar_eliminar_vac = None
                                                     st.rerun()
-                                            with c_n:
-                                                if st.button("No", key=f"no_vac_{vid}"):
+                                            with col_no_v:
+                                                if st.button("❌ No", key=f"no_vac_{vid}"):
                                                     st.session_state.confirmar_eliminar_vac = None
                                                     st.rerun()
                                         else:
-                                            if st.button("🗑️", key=f"del_vac_{vid}", help="Eliminar"):
+                                            if st.button("🗑️ Eliminar", key=f"del_vac_{vid}"):
                                                 st.session_state.confirmar_eliminar_vac = vid
                                                 st.rerun()
+
+                                    st.divider()
 
             st.divider()
             excel_vac = generar_excel_vacaciones(df_info_todos, df_vac_todos, df_pagos_vac_todos, lista_conductores_vac)
@@ -1756,9 +1717,12 @@ def main():
                     with col2v:
                         dias_auto = max(1, (ff_vac - fi_vac).days + 1) if ff_vac >= fi_vac else 1
                         st.metric("Días calculados automáticamente", dias_auto)
+                        # ── FIX: clampear dias_auto para no superar max_value=60 ──
                         dias_vac  = st.number_input(
                             "Días (ajustable manualmente)",
-                            min_value=1, max_value=60, value=dias_auto
+                            min_value=1,
+                            max_value=60,
+                            value=min(int(dias_auto), 60)
                         )
                         reg_por_v = st.text_input("Registrado por", placeholder="Tu nombre completo")
                         obs_vac   = st.text_area("Observaciones", height=80)

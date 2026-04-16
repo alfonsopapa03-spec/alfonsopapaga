@@ -1,10 +1,12 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v15: 
+v16: 
   - Fechas mostradas en formato DD/MM/YYYY
   - Períodos con vacaciones tomadas pero SIN pago en dinero → 🟡 advertencia (no verde)
   - Pago en dinero registrado → 💵 info (no marca como completado; indica que aún faltan vacaciones físicas)
+  - NUEVO: Editar fecha de ingreso de conductores directamente desde la tabla de fechas registradas
+  - NUEVO: Botón "Registrar/Editar pago en dinero" siempre visible en TODOS los períodos
 """
 
 import streamlit as st
@@ -93,7 +95,7 @@ def badge_alerta(dias, nivel):
     else:
         return f"🟢 {dias}d"
 
-# ==================== LÓGICA VACACIONES v15 ====================
+# ==================== LÓGICA VACACIONES v16 ====================
 
 def calcular_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.DataFrame, hoy: date) -> dict:
     anios_completos = 0
@@ -328,7 +330,7 @@ def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) 
     return output
 
 
-# ==================== EXPORTAR EXCEL VACACIONES v15 ====================
+# ==================== EXPORTAR EXCEL VACACIONES v16 ====================
 def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, df_pagos_vac: pd.DataFrame, conductores: list) -> BytesIO:
     wb = Workbook()
     ws = wb.active
@@ -744,7 +746,7 @@ class DB:
     def eliminar_vacacion(self, vac_id):
         self._exec("DELETE FROM vacaciones WHERE id = %s", (vac_id,))
 
-    # ---- Pagos de vacaciones en dinero (v15) ----
+    # ---- Pagos de vacaciones en dinero (v16) ----
     def obtener_pagos_vacaciones(self, conductor=None):
         if conductor:
             return self._query_df(
@@ -955,6 +957,125 @@ def calcular_saldo_prestamo(prestamo_id, monto_total, df_pagos):
     return pagado, saldo
 
 
+# ==================== WIDGET PAGO VACACIONES (reutilizable) ====================
+def widget_pago_vacacion(db, cond, anio_num, p, dias_pend_p, pagado_en_dinero,
+                          monto_pago_din, fecha_pago_din, reg_por_din, pago_vac_id):
+    """
+    Muestra siempre el botón de registrar/editar pago en dinero para un período.
+    Si ya existe pago, muestra 'Editar pago'. Si no, muestra 'Registrar pago en dinero'.
+    También permite eliminar el pago existente.
+    """
+    clave_form = (cond, anio_num)
+    label_boton = "✏️ Editar pago en dinero" if pagado_en_dinero else "💵 Registrar pago en dinero"
+
+    if st.session_state.pago_vac_periodo != clave_form:
+        col_btn1, col_btn2 = st.columns([2, 2])
+        with col_btn1:
+            if st.button(label_boton, key=f"btn_pago_vac_{cond}_{anio_num}", type="primary"):
+                st.session_state.pago_vac_periodo = clave_form
+                st.rerun()
+        if pagado_en_dinero and pago_vac_id:
+            with col_btn2:
+                if st.session_state.confirmar_eliminar_pago_vac == pago_vac_id:
+                    st.warning(f"¿Eliminar el pago de **{p['label']}**?")
+                    col_si_pv, col_no_pv, _ = st.columns([1, 1, 4])
+                    with col_si_pv:
+                        if st.button("✅ Sí", key=f"si_pvac_{pago_vac_id}", type="primary"):
+                            db.eliminar_pago_vacacion(pago_vac_id)
+                            st.session_state.confirmar_eliminar_pago_vac = None
+                            st.rerun()
+                    with col_no_pv:
+                        if st.button("❌ No", key=f"no_pvac_{pago_vac_id}"):
+                            st.session_state.confirmar_eliminar_pago_vac = None
+                            st.rerun()
+                else:
+                    if st.button("🗑️ Eliminar pago", key=f"del_pvac_{cond}_{anio_num}",
+                                  help="Eliminar pago registrado (revertir a pendiente)"):
+                        st.session_state.confirmar_eliminar_pago_vac = pago_vac_id
+                        st.rerun()
+
+    if st.session_state.pago_vac_periodo == clave_form:
+        titulo_form = f"**{'✏️ Editar' if pagado_en_dinero else '💵 Registrar'} pago en dinero — {p['label']}**"
+        with st.form(f"form_pago_vac_{cond}_{anio_num}"):
+            st.markdown(titulo_form)
+            if dias_pend_p > 0:
+                st.caption(f"Días pendientes a compensar: **{dias_pend_p}**")
+            col_pv1, col_pv2 = st.columns(2)
+            with col_pv1:
+                valor_inicial_monto = fmt(monto_pago_din) if pagado_en_dinero and monto_pago_din > 0 else ""
+                monto_pv_txt = st.text_input(
+                    "Monto pagado (COP)",
+                    value=valor_inicial_monto,
+                    placeholder="Ej: 750.000",
+                    key=f"monto_pv_{cond}_{anio_num}"
+                )
+                monto_pv = limpiar(monto_pv_txt)
+                if monto_pv > 0:
+                    st.caption(f"💵 {fmt(monto_pv)} COP")
+                # Fecha inicial: si ya hay pago, usar esa fecha; si no, hoy
+                fecha_default_pv = datetime.today()
+                if pagado_en_dinero and fecha_pago_din and fecha_pago_din != "—":
+                    try:
+                        # fecha_pago_din ya viene formateada DD/MM/YYYY, necesitamos parsearla
+                        fecha_default_pv = datetime.strptime(fecha_pago_din, '%d/%m/%Y')
+                    except:
+                        fecha_default_pv = datetime.today()
+                fecha_pv = st.date_input(
+                    "Fecha del pago",
+                    value=fecha_default_pv,
+                    key=f"fecha_pv_{cond}_{anio_num}"
+                )
+            with col_pv2:
+                reg_por_pv = st.text_input(
+                    "Registrado por",
+                    value=reg_por_din if pagado_en_dinero else "",
+                    placeholder="Tu nombre completo",
+                    key=f"reg_pv_{cond}_{anio_num}"
+                )
+                obs_pv = st.text_area(
+                    "Observaciones",
+                    height=68,
+                    key=f"obs_pv_{cond}_{anio_num}"
+                )
+
+            col_gp, col_cp = st.columns(2)
+            with col_gp:
+                guardar_pv = st.form_submit_button("💾 Guardar pago", type="primary")
+            with col_cp:
+                cancelar_pv = st.form_submit_button("✖ Cancelar")
+
+            if guardar_pv:
+                errores_pv = []
+                if monto_pv <= 0:
+                    errores_pv.append("El monto debe ser mayor a 0.")
+                if not reg_por_pv.strip():
+                    errores_pv.append("Ingresa tu nombre.")
+                if errores_pv:
+                    for ep in errores_pv:
+                        st.error(f"⚠️ {ep}")
+                else:
+                    nid_pv = db.registrar_pago_vacacion({
+                        'conductor': cond,
+                        'anio_laboral': anio_num,
+                        'periodo_label': p['label'],
+                        'monto_cop': monto_pv,
+                        'fecha_pago': fecha_pv,
+                        'observaciones': obs_pv.strip(),
+                        'registrado_por': reg_por_pv.strip(),
+                    })
+                    if nid_pv:
+                        accion = "actualizado" if pagado_en_dinero else "registrado"
+                        st.success(
+                            f"✅ Pago {accion} para **{cond}** — "
+                            f"{p['label']} — ${fmt(monto_pv)} COP"
+                        )
+                        st.session_state.pago_vac_periodo = None
+                        st.rerun()
+            if cancelar_pv:
+                st.session_state.pago_vac_periodo = None
+                st.rerun()
+
+
 # ==================== APP PRINCIPAL ====================
 def main():
     st.set_page_config(page_title="Anticipos - Transporte de Carga", layout="wide", page_icon="🚛")
@@ -968,6 +1089,8 @@ def main():
         'confirmar_eliminar_prestamo': None, 'confirmar_eliminar_pago': None,
         'pago_vac_periodo': None,
         'confirmar_eliminar_pago_vac': None,
+        # NUEVO v16: edición de fecha de ingreso
+        'editando_fecha_ingreso_conductor': None,
     }
     for key, val in session_defaults.items():
         if key not in st.session_state:
@@ -1139,7 +1262,6 @@ def main():
                 lambda r: "—" if r.get('legalizado') else badge_alerta(*clasificar_alerta(r['fecha_viaje'])), axis=1)
             df_show['valor_anticipo'] = df_show['valor_anticipo'].apply(lambda x: f"${fmt(x)}")
             df_show['legalizado'] = df_show['legalizado'].apply(lambda x: "✅ Legalizado" if x else "🔴 Pendiente")
-            # Formatear fechas a DD/MM/YYYY
             df_show['fecha_viaje'] = df_show['fecha_viaje'].apply(fmt_fecha)
             df_show['fecha_legalizacion'] = df_show['fecha_legalizacion'].apply(
                 lambda x: fmt_fecha(x) if pd.notna(x) and str(x) not in ['', 'None', 'NaT'] else "—"
@@ -1255,7 +1377,7 @@ def main():
                     if cancelar_edit:
                         st.session_state.editando_id = None; st.rerun()
 
-    # ==================== TAB 4: VACACIONES v15 ====================
+    # ==================== TAB 4: VACACIONES v16 ====================
     with tab_vac:
         st.header("🏖️ Control de Vacaciones")
         st.caption(f"Regla: {DIAS_VACACIONES_ANUALES} días de vacaciones por cada año laboral completado.")
@@ -1441,12 +1563,8 @@ def main():
                                 f"(en {calc['dias_para_proxima']} días)"
                             )
 
-                        # ── Cronología de períodos — lógica v15 ──
-                        # REGLAS:
-                        # ✅ verde  → días tomados == 15 Y pago en dinero registrado (o días == 15 sin necesidad de pago)
-                        # 🟡 amarillo → días tomados > 0 pero < 15, sin pago registrado → "Vacaciones parciales, falta pago"
-                        # 💵 azul    → pago en dinero registrado, pero aún faltan vacaciones físicas por tomar
-                        # 🔴 rojo    → 0 días tomados y sin pago → completamente pendiente
+                        # ── Cronología de períodos v16 ──
+                        # SIEMPRE muestra botón de registrar/editar pago en todos los períodos
                         if calc["periodos"]:
                             st.markdown("**Períodos anuales completados:**")
                             for p in calc["periodos"]:
@@ -1466,18 +1584,18 @@ def main():
                                     if not pagos_cond_df.empty else pd.DataFrame()
                                 pagado_en_dinero = not pago_row.empty
                                 monto_pago_din   = int(pago_row.iloc[0]["monto_cop"]) if pagado_en_dinero else 0
-                                fecha_pago_din   = fmt_fecha(pago_row.iloc[0]["fecha_pago"]) if pagado_en_dinero else ""
-                                reg_por_din      = pago_row.iloc[0].get("registrado_por","") if pagado_en_dinero else ""
+                                fecha_pago_din   = fmt_fecha(pago_row.iloc[0]["fecha_pago"]) if pagado_en_dinero else "—"
+                                reg_por_din      = str(pago_row.iloc[0].get("registrado_por","")) if pagado_en_dinero else ""
                                 pago_vac_id      = int(pago_row.iloc[0]["id"]) if pagado_en_dinero else None
 
-                                # ── CASO 1: Todos los días tomados físicamente Y sin días restantes ──
+                                # ── CASO 1: Todos los días tomados físicamente, sin pago en dinero ──
                                 if dias_pend_p <= 0 and not pagado_en_dinero:
                                     st.success(
                                         f"✅ **{p['label']}** — "
                                         f"{dias_tomados} días tomados físicamente. Período completo."
                                     )
 
-                                # ── CASO 2: Todos los días tomados físicamente Y hay pago (redundante pero posible) ──
+                                # ── CASO 2: Todos los días tomados físicamente Y hay pago ──
                                 elif dias_pend_p <= 0 and pagado_en_dinero:
                                     st.success(
                                         f"✅ **{p['label']}** — "
@@ -1485,7 +1603,7 @@ def main():
                                         f"({fecha_pago_din}). Período completo."
                                     )
 
-                                # ── CASO 3: Hay pago en dinero registrado, pero AÚN faltan días físicos ──
+                                # ── CASO 3: Pago en dinero registrado, aún faltan días físicos ──
                                 elif pagado_en_dinero and dias_pend_p > 0:
                                     st.info(
                                         f"💵 **{p['label']}** — "
@@ -1496,31 +1614,10 @@ def main():
                                         + (f" · Registrado por: {reg_por_din}" if reg_por_din else "")
                                     )
                                     st.caption(
-                                        "ℹ️ Se registró pago en dinero, pero aún faltan vacaciones físicas por tomar. "
-                                        "Puedes eliminar el pago si fue un error."
+                                        "ℹ️ Pago registrado, pero aún faltan vacaciones físicas por tomar."
                                     )
-                                    if st.session_state.confirmar_eliminar_pago_vac == pago_vac_id:
-                                        st.warning(f"¿Eliminar el pago de **{p['label']}**? Quedará como pendiente.")
-                                        col_si_pv, col_no_pv, _ = st.columns([1, 1, 4])
-                                        with col_si_pv:
-                                            if st.button("✅ Sí", key=f"si_pvac_{pago_vac_id}", type="primary"):
-                                                db.eliminar_pago_vacacion(pago_vac_id)
-                                                st.session_state.confirmar_eliminar_pago_vac = None
-                                                st.rerun()
-                                        with col_no_pv:
-                                            if st.button("❌ No", key=f"no_pvac_{pago_vac_id}"):
-                                                st.session_state.confirmar_eliminar_pago_vac = None
-                                                st.rerun()
-                                    else:
-                                        if st.button(
-                                            "🗑️ Eliminar pago",
-                                            key=f"del_pvac_{cond}_{anio_num}",
-                                            help="Eliminar pago en dinero (revertir a pendiente)"
-                                        ):
-                                            st.session_state.confirmar_eliminar_pago_vac = pago_vac_id
-                                            st.rerun()
 
-                                # ── CASO 4: Días parcialmente tomados, SIN pago registrado ──
+                                # ── CASO 4: Días parcialmente tomados, sin pago ──
                                 elif dias_tomados > 0 and dias_pend_p > 0 and not pagado_en_dinero:
                                     st.warning(
                                         f"🟡 **{p['label']}** — "
@@ -1528,86 +1625,8 @@ def main():
                                         f"**{dias_pend_p} días pendientes** · "
                                         f"Faltan vacaciones o pago en dinero"
                                     )
-                                    clave_form = (cond, anio_num)
-                                    if st.session_state.pago_vac_periodo != clave_form:
-                                        if st.button(
-                                            "💵 Registrar pago en dinero",
-                                            key=f"btn_pago_vac_{cond}_{anio_num}",
-                                            type="primary"
-                                        ):
-                                            st.session_state.pago_vac_periodo = clave_form
-                                            st.rerun()
 
-                                    if st.session_state.pago_vac_periodo == (cond, anio_num):
-                                        with st.form(f"form_pago_vac_{cond}_{anio_num}"):
-                                            st.markdown(
-                                                f"**💵 Registrar pago en dinero — {p['label']}**  \n"
-                                                f"Días pendientes a compensar: **{dias_pend_p}**"
-                                            )
-                                            col_pv1, col_pv2 = st.columns(2)
-                                            with col_pv1:
-                                                monto_pv_txt = st.text_input(
-                                                    "Monto pagado (COP)",
-                                                    placeholder="Ej: 750.000",
-                                                    key=f"monto_pv_{cond}_{anio_num}"
-                                                )
-                                                monto_pv = limpiar(monto_pv_txt)
-                                                if monto_pv > 0:
-                                                    st.caption(f"💵 {fmt(monto_pv)} COP")
-                                                fecha_pv = st.date_input(
-                                                    "Fecha del pago",
-                                                    value=datetime.today(),
-                                                    key=f"fecha_pv_{cond}_{anio_num}"
-                                                )
-                                            with col_pv2:
-                                                reg_por_pv = st.text_input(
-                                                    "Registrado por",
-                                                    placeholder="Tu nombre completo",
-                                                    key=f"reg_pv_{cond}_{anio_num}"
-                                                )
-                                                obs_pv = st.text_area(
-                                                    "Observaciones",
-                                                    height=68,
-                                                    key=f"obs_pv_{cond}_{anio_num}"
-                                                )
-
-                                            col_gp, col_cp = st.columns(2)
-                                            with col_gp:
-                                                guardar_pv = st.form_submit_button("💾 Guardar pago", type="primary")
-                                            with col_cp:
-                                                cancelar_pv = st.form_submit_button("✖ Cancelar")
-
-                                            if guardar_pv:
-                                                errores_pv = []
-                                                if monto_pv <= 0:
-                                                    errores_pv.append("El monto debe ser mayor a 0.")
-                                                if not reg_por_pv.strip():
-                                                    errores_pv.append("Ingresa tu nombre.")
-                                                if errores_pv:
-                                                    for ep in errores_pv:
-                                                        st.error(f"⚠️ {ep}")
-                                                else:
-                                                    nid_pv = db.registrar_pago_vacacion({
-                                                        'conductor': cond,
-                                                        'anio_laboral': anio_num,
-                                                        'periodo_label': p['label'],
-                                                        'monto_cop': monto_pv,
-                                                        'fecha_pago': fecha_pv,
-                                                        'observaciones': obs_pv.strip(),
-                                                        'registrado_por': reg_por_pv.strip(),
-                                                    })
-                                                    if nid_pv:
-                                                        st.success(
-                                                            f"✅ Pago registrado para **{cond}** — "
-                                                            f"{p['label']} — ${fmt(monto_pv)} COP"
-                                                        )
-                                                        st.session_state.pago_vac_periodo = None
-                                                        st.rerun()
-                                            if cancelar_pv:
-                                                st.session_state.pago_vac_periodo = None
-                                                st.rerun()
-
-                                # ── CASO 5: 0 días tomados, sin pago → completamente pendiente ──
+                                # ── CASO 5: 0 días tomados, sin pago ──
                                 else:
                                     st.error(
                                         f"🔴 **{p['label']}** — "
@@ -1615,84 +1634,14 @@ def main():
                                         f"**{dias_pend_p} días pendientes** · "
                                         f"Sin vacaciones ni pago registrado"
                                     )
-                                    clave_form = (cond, anio_num)
-                                    if st.session_state.pago_vac_periodo != clave_form:
-                                        if st.button(
-                                            "💵 Registrar pago en dinero",
-                                            key=f"btn_pago_vac_{cond}_{anio_num}",
-                                            type="primary"
-                                        ):
-                                            st.session_state.pago_vac_periodo = clave_form
-                                            st.rerun()
 
-                                    if st.session_state.pago_vac_periodo == (cond, anio_num):
-                                        with st.form(f"form_pago_vac_{cond}_{anio_num}"):
-                                            st.markdown(
-                                                f"**💵 Registrar pago en dinero — {p['label']}**  \n"
-                                                f"Días a compensar: **{dias_pend_p}**"
-                                            )
-                                            col_pv1, col_pv2 = st.columns(2)
-                                            with col_pv1:
-                                                monto_pv_txt = st.text_input(
-                                                    "Monto pagado (COP)",
-                                                    placeholder="Ej: 750.000",
-                                                    key=f"monto_pv_{cond}_{anio_num}"
-                                                )
-                                                monto_pv = limpiar(monto_pv_txt)
-                                                if monto_pv > 0:
-                                                    st.caption(f"💵 {fmt(monto_pv)} COP")
-                                                fecha_pv = st.date_input(
-                                                    "Fecha del pago",
-                                                    value=datetime.today(),
-                                                    key=f"fecha_pv_{cond}_{anio_num}"
-                                                )
-                                            with col_pv2:
-                                                reg_por_pv = st.text_input(
-                                                    "Registrado por",
-                                                    placeholder="Tu nombre completo",
-                                                    key=f"reg_pv_{cond}_{anio_num}"
-                                                )
-                                                obs_pv = st.text_area(
-                                                    "Observaciones",
-                                                    height=68,
-                                                    key=f"obs_pv_{cond}_{anio_num}"
-                                                )
-
-                                            col_gp, col_cp = st.columns(2)
-                                            with col_gp:
-                                                guardar_pv = st.form_submit_button("💾 Guardar pago", type="primary")
-                                            with col_cp:
-                                                cancelar_pv = st.form_submit_button("✖ Cancelar")
-
-                                            if guardar_pv:
-                                                errores_pv = []
-                                                if monto_pv <= 0:
-                                                    errores_pv.append("El monto debe ser mayor a 0.")
-                                                if not reg_por_pv.strip():
-                                                    errores_pv.append("Ingresa tu nombre.")
-                                                if errores_pv:
-                                                    for ep in errores_pv:
-                                                        st.error(f"⚠️ {ep}")
-                                                else:
-                                                    nid_pv = db.registrar_pago_vacacion({
-                                                        'conductor': cond,
-                                                        'anio_laboral': anio_num,
-                                                        'periodo_label': p['label'],
-                                                        'monto_cop': monto_pv,
-                                                        'fecha_pago': fecha_pv,
-                                                        'observaciones': obs_pv.strip(),
-                                                        'registrado_por': reg_por_pv.strip(),
-                                                    })
-                                                    if nid_pv:
-                                                        st.success(
-                                                            f"✅ Pago registrado para **{cond}** — "
-                                                            f"{p['label']} — ${fmt(monto_pv)} COP"
-                                                        )
-                                                        st.session_state.pago_vac_periodo = None
-                                                        st.rerun()
-                                            if cancelar_pv:
-                                                st.session_state.pago_vac_periodo = None
-                                                st.rerun()
+                                # ── SIEMPRE mostrar botón de registrar/editar pago ──
+                                widget_pago_vacacion(
+                                    db, cond, anio_num, p, dias_pend_p,
+                                    pagado_en_dinero, monto_pago_din,
+                                    fecha_pago_din, reg_por_din, pago_vac_id
+                                )
+                                st.markdown("---")
 
                     with col_vb:
                         st.markdown("**Vacaciones registradas (tomadas):**")
@@ -1834,7 +1783,7 @@ def main():
                     )
 
                 st.divider()
-                with st.form("form_vacacion_v15", clear_on_submit=True):
+                with st.form("form_vacacion_v16", clear_on_submit=True):
                     col1v, col2v = st.columns(2)
                     with col1v:
                         fi_vac = st.date_input("Fecha inicio vacaciones", value=datetime.today())
@@ -1883,7 +1832,6 @@ def main():
                     st.info("Sin registros de vacaciones aún.")
                 else:
                     df_hist_show = df_hist_cond[["id","fecha_inicio","fecha_fin","dias","observaciones","registrado_por"]].copy()
-                    # Formatear fechas DD/MM/YYYY
                     df_hist_show["fecha_inicio"] = df_hist_show["fecha_inicio"].apply(fmt_fecha)
                     df_hist_show["fecha_fin"]    = df_hist_show["fecha_fin"].apply(fmt_fecha)
                     df_hist_show.columns = ["ID","Inicio","Fin","Días","Observaciones","Registrado por"]
@@ -1909,15 +1857,20 @@ def main():
                         st.rerun()
 
             st.divider()
-            st.subheader("Fechas registradas y resumen rápido")
+
+            # ── v16: Tabla editable de fechas registradas ──
+            st.subheader("Fechas registradas — editar directamente")
+            st.caption("Haz clic en ✏️ para editar la fecha de ingreso de cualquier conductor.")
+
             df_info_show = db.obtener_todos_info_conductores()
             if df_info_show.empty:
                 st.info("No hay fechas de ingreso registradas.")
             else:
                 for _, irow in df_info_show.iterrows():
+                    cond_nombre = irow['conductor']
                     fi_d = pd.to_datetime(irow['fecha_ingreso']).date()
                     anios_t = round((hoy - fi_d).days / 365.25, 1)
-                    calc_r  = calcular_vacaciones(irow['conductor'], fi_d, df_vac_todos, hoy)
+                    calc_r  = calcular_vacaciones(cond_nombre, fi_d, df_vac_todos, hoy)
 
                     if calc_r["dias_vencidos"] > 0:
                         icono = "🔴"
@@ -1926,18 +1879,62 @@ def main():
                     else:
                         icono = "🟢"
 
-                    st.write(
-                        f"{icono} **{irow['conductor']}** — "
-                        f"Ingreso: **{fi_d.strftime('%d/%m/%Y')}** — "
-                        f"Antigüedad: {anios_t} años — "
-                        f"Años completos: **{calc_r['anios_completos']}** — "
-                        f"Días generados: **{calc_r['dias_generados']}** — "
-                        f"Días usados: **{calc_r['dias_usados']}** — "
-                        f"Días pendientes: **{calc_r['dias_vencidos']}** — "
-                        f"Próxima vacación: **{calc_r['proxima_fecha'].strftime('%d/%m/%Y')}** "
-                        f"(en {calc_r['dias_para_proxima']} días)"
-                        + (f"  |  {irow['observaciones']}" if irow.get('observaciones') else "")
-                    )
+                    # Si estamos editando este conductor
+                    if st.session_state.editando_fecha_ingreso_conductor == cond_nombre:
+                        with st.form(f"form_edit_fi_{cond_nombre}"):
+                            st.markdown(f"**✏️ Editando fecha de ingreso: {cond_nombre}**")
+                            col_efi1, col_efi2, col_efi3 = st.columns([2, 2, 2])
+                            with col_efi1:
+                                nueva_fecha_fi = st.date_input(
+                                    "Nueva fecha de ingreso",
+                                    value=fi_d,
+                                    key=f"nueva_fi_{cond_nombre}"
+                                )
+                            with col_efi2:
+                                nueva_obs_fi = st.text_input(
+                                    "Observaciones",
+                                    value=irow.get('observaciones','') or '',
+                                    key=f"nueva_obs_fi_{cond_nombre}"
+                                )
+                            with col_efi3:
+                                st.markdown("&nbsp;")
+                            col_gfi, col_cfi = st.columns([1, 1])
+                            with col_gfi:
+                                guardar_fi_edit = st.form_submit_button("💾 Guardar cambio", type="primary")
+                            with col_cfi:
+                                cancelar_fi_edit = st.form_submit_button("✖ Cancelar")
+
+                            if guardar_fi_edit:
+                                ok_efi = db.guardar_info_conductor(cond_nombre, nueva_fecha_fi, nueva_obs_fi)
+                                if ok_efi:
+                                    st.success(
+                                        f"✅ Fecha de ingreso de **{cond_nombre}** actualizada a "
+                                        f"**{nueva_fecha_fi.strftime('%d/%m/%Y')}**"
+                                    )
+                                    st.session_state.editando_fecha_ingreso_conductor = None
+                                    st.rerun()
+                            if cancelar_fi_edit:
+                                st.session_state.editando_fecha_ingreso_conductor = None
+                                st.rerun()
+                    else:
+                        col_info_fi, col_btn_fi = st.columns([6, 1])
+                        with col_info_fi:
+                            st.write(
+                                f"{icono} **{cond_nombre}** — "
+                                f"Ingreso: **{fi_d.strftime('%d/%m/%Y')}** — "
+                                f"Antigüedad: {anios_t} años — "
+                                f"Años completos: **{calc_r['anios_completos']}** — "
+                                f"Días generados: **{calc_r['dias_generados']}** — "
+                                f"Días usados: **{calc_r['dias_usados']}** — "
+                                f"Días pendientes: **{calc_r['dias_vencidos']}** — "
+                                f"Próxima vacación: **{calc_r['proxima_fecha'].strftime('%d/%m/%Y')}** "
+                                f"(en {calc_r['dias_para_proxima']} días)"
+                                + (f"  |  {irow['observaciones']}" if irow.get('observaciones') else "")
+                            )
+                        with col_btn_fi:
+                            if st.button("✏️ Editar", key=f"btn_edit_fi_{cond_nombre}"):
+                                st.session_state.editando_fecha_ingreso_conductor = cond_nombre
+                                st.rerun()
 
     # ==================== TAB 5: PRÉSTAMOS ====================
     with tab_prest:

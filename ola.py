@@ -1,7 +1,10 @@
 """
 Sistema de Registro y Legalización de Anticipos - Transporte de Carga
 Colombia - Conectado a Supabase (PostgreSQL)
-v16: 
+v17:
+  - Observaciones del viaje visibles en tabla Historial
+  - Observaciones del viaje visibles en expander de Legalizar anticipos
+  - Observaciones del viaje visibles en "Acciones sobre un viaje"
   - Fechas mostradas en formato DD/MM/YYYY
   - Períodos con vacaciones tomadas pero SIN pago en dinero → 🟡 advertencia (no verde)
   - Pago en dinero registrado → 💵 info (no marca como completado; indica que aún faltan vacaciones físicas)
@@ -960,11 +963,6 @@ def calcular_saldo_prestamo(prestamo_id, monto_total, df_pagos):
 # ==================== WIDGET PAGO VACACIONES (reutilizable) ====================
 def widget_pago_vacacion(db, cond, anio_num, p, dias_pend_p, pagado_en_dinero,
                           monto_pago_din, fecha_pago_din, reg_por_din, pago_vac_id):
-    """
-    Muestra siempre el botón de registrar/editar pago en dinero para un período.
-    Si ya existe pago, muestra 'Editar pago'. Si no, muestra 'Registrar pago en dinero'.
-    También permite eliminar el pago existente.
-    """
     clave_form = (cond, anio_num)
     label_boton = "✏️ Editar pago en dinero" if pagado_en_dinero else "💵 Registrar pago en dinero"
 
@@ -1012,11 +1010,9 @@ def widget_pago_vacacion(db, cond, anio_num, p, dias_pend_p, pagado_en_dinero,
                 monto_pv = limpiar(monto_pv_txt)
                 if monto_pv > 0:
                     st.caption(f"💵 {fmt(monto_pv)} COP")
-                # Fecha inicial: si ya hay pago, usar esa fecha; si no, hoy
                 fecha_default_pv = datetime.today()
                 if pagado_en_dinero and fecha_pago_din and fecha_pago_din != "—":
                     try:
-                        # fecha_pago_din ya viene formateada DD/MM/YYYY, necesitamos parsearla
                         fecha_default_pv = datetime.strptime(fecha_pago_din, '%d/%m/%Y')
                     except:
                         fecha_default_pv = datetime.today()
@@ -1089,7 +1085,6 @@ def main():
         'confirmar_eliminar_prestamo': None, 'confirmar_eliminar_pago': None,
         'pago_vac_periodo': None,
         'confirmar_eliminar_pago_vac': None,
-        # NUEVO v16: edición de fecha de ingreso
         'editando_fecha_ingreso_conductor': None,
     }
     for key, val in session_defaults.items():
@@ -1212,6 +1207,9 @@ def main():
                         st.write(f"📅 Fecha: {fmt_fecha(row['fecha_viaje'])} | 🚛 {row['placa']} | 👤 {row['conductor']}")
                         st.write(f"🏢 {row['cliente']} | 📍 {row['origen']} → {row['destino']}")
                         st.write(f"💰 **${fmt(row['valor_anticipo'])} COP**")
+                        # ── NUEVO v17: observaciones del viaje en legalizar ──
+                        if row.get('observaciones'):
+                            st.info(f"📝 Observaciones: {row['observaciones']}")
                     with col_form:
                         st.markdown("**Legalizar este viaje:**")
                         nombre_leg = st.text_input("Tu nombre completo", key=f"nombre_leg_{row['id']}")
@@ -1255,8 +1253,9 @@ def main():
             col_m3.metric("Pendientes",      pendientes)
             col_m4.metric("Total anticipos", f"${fmt(total_anticipo)}")
 
+            # ── NUEVO v17: observaciones incluida en la tabla del historial ──
             cols_tabla = ['id','manifiesto','fecha_viaje','placa','conductor','cliente','origen',
-                          'destino','valor_anticipo','legalizado','legalizado_por','fecha_legalizacion']
+                          'destino','valor_anticipo','observaciones','legalizado','legalizado_por','fecha_legalizacion']
             df_show = df_hist[[c for c in cols_tabla if c in df_hist.columns]].copy()
             df_show['dias_alerta'] = df_hist.apply(
                 lambda r: "—" if r.get('legalizado') else badge_alerta(*clasificar_alerta(r['fecha_viaje'])), axis=1)
@@ -1266,10 +1265,14 @@ def main():
             df_show['fecha_legalizacion'] = df_show['fecha_legalizacion'].apply(
                 lambda x: fmt_fecha(x) if pd.notna(x) and str(x) not in ['', 'None', 'NaT'] else "—"
             )
+            df_show['observaciones'] = df_show['observaciones'].fillna('').apply(
+                lambda x: x if x else "—"
+            )
             df_show.rename(columns={
                 'id':'ID','manifiesto':'Manifiesto','fecha_viaje':'Fecha viaje','placa':'Placa',
                 'conductor':'Conductor','cliente':'Cliente','origen':'Origen','destino':'Destino',
-                'valor_anticipo':'Anticipo','legalizado':'Estado','legalizado_por':'Legalizado por',
+                'valor_anticipo':'Anticipo','observaciones':'Observaciones','legalizado':'Estado',
+                'legalizado_por':'Legalizado por',
                 'fecha_legalizacion':'Fecha legalización','dias_alerta':'Alerta'
             }, inplace=True)
             st.dataframe(df_show, use_container_width=True, hide_index=True, height=350)
@@ -1301,6 +1304,9 @@ def main():
                 st.write(f"📄 Manifiesto: **{row_sel.get('manifiesto', '—')}**")
                 st.write(f"Fecha: {fmt_fecha(row_sel['fecha_viaje'])} | Placa: {row_sel['placa']} | Conductor: {row_sel['conductor']}")
                 st.write(f"Ruta: {row_sel['origen']} → {row_sel['destino']} | Anticipo: **${fmt(row_sel['valor_anticipo'])} COP**")
+                # ── NUEVO v17: observaciones del viaje en acciones ──
+                if row_sel.get('observaciones'):
+                    st.info(f"📝 Observaciones: {row_sel['observaciones']}")
                 if row_sel['legalizado']:
                     st.success(f"Legalizado por: **{row_sel['legalizado_por']}** | Fecha: {fmt_fecha(row_sel['fecha_legalizacion'])}")
             with col_acc:
@@ -1563,8 +1569,6 @@ def main():
                                 f"(en {calc['dias_para_proxima']} días)"
                             )
 
-                        # ── Cronología de períodos v16 ──
-                        # SIEMPRE muestra botón de registrar/editar pago en todos los períodos
                         if calc["periodos"]:
                             st.markdown("**Períodos anuales completados:**")
                             for p in calc["periodos"]:
@@ -1588,22 +1592,17 @@ def main():
                                 reg_por_din      = str(pago_row.iloc[0].get("registrado_por","")) if pagado_en_dinero else ""
                                 pago_vac_id      = int(pago_row.iloc[0]["id"]) if pagado_en_dinero else None
 
-                                # ── CASO 1: Todos los días tomados físicamente, sin pago en dinero ──
                                 if dias_pend_p <= 0 and not pagado_en_dinero:
                                     st.success(
                                         f"✅ **{p['label']}** — "
                                         f"{dias_tomados} días tomados físicamente. Período completo."
                                     )
-
-                                # ── CASO 2: Todos los días tomados físicamente Y hay pago ──
                                 elif dias_pend_p <= 0 and pagado_en_dinero:
                                     st.success(
                                         f"✅ **{p['label']}** — "
                                         f"{dias_tomados} días tomados. Pago registrado: ${fmt(monto_pago_din)} COP "
                                         f"({fecha_pago_din}). Período completo."
                                     )
-
-                                # ── CASO 3: Pago en dinero registrado, aún faltan días físicos ──
                                 elif pagado_en_dinero and dias_pend_p > 0:
                                     st.info(
                                         f"💵 **{p['label']}** — "
@@ -1616,8 +1615,6 @@ def main():
                                     st.caption(
                                         "ℹ️ Pago registrado, pero aún faltan vacaciones físicas por tomar."
                                     )
-
-                                # ── CASO 4: Días parcialmente tomados, sin pago ──
                                 elif dias_tomados > 0 and dias_pend_p > 0 and not pagado_en_dinero:
                                     st.warning(
                                         f"🟡 **{p['label']}** — "
@@ -1625,8 +1622,6 @@ def main():
                                         f"**{dias_pend_p} días pendientes** · "
                                         f"Faltan vacaciones o pago en dinero"
                                     )
-
-                                # ── CASO 5: 0 días tomados, sin pago ──
                                 else:
                                     st.error(
                                         f"🔴 **{p['label']}** — "
@@ -1635,7 +1630,6 @@ def main():
                                         f"Sin vacaciones ni pago registrado"
                                     )
 
-                                # ── SIEMPRE mostrar botón de registrar/editar pago ──
                                 widget_pago_vacacion(
                                     db, cond, anio_num, p, dias_pend_p,
                                     pagado_en_dinero, monto_pago_din,
@@ -1858,7 +1852,6 @@ def main():
 
             st.divider()
 
-            # ── v16: Tabla editable de fechas registradas ──
             st.subheader("Fechas registradas — editar directamente")
             st.caption("Haz clic en ✏️ para editar la fecha de ingreso de cualquier conductor.")
 
@@ -1879,7 +1872,6 @@ def main():
                     else:
                         icono = "🟢"
 
-                    # Si estamos editando este conductor
                     if st.session_state.editando_fecha_ingreso_conductor == cond_nombre:
                         with st.form(f"form_edit_fi_{cond_nombre}"):
                             st.markdown(f"**✏️ Editando fecha de ingreso: {cond_nombre}**")

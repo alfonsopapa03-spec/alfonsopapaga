@@ -24,7 +24,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ==================== CONFIGURACIÓN ====================
-SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito800$@aws-1-us-east-1.pooler.supabase.com:6543/postgreshttps://github.com/alfonsopapa03-spec/alfonsopapaga/edit/main/ola.py"
+SUPABASE_DB_URL = "postgresql://postgres.wiomyjrmsrhcgvhgkbqe:Conejito800$@aws-1-us-west-2.pooler.supabase.com:6543/postgres"
 DIAS_VACACIONES_ANUALES = 15
 
 # ==================== FORMATO COLOMBIANO ====================
